@@ -1,0 +1,14 @@
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Local test output
+*.log
+shellcheck-report.txt
