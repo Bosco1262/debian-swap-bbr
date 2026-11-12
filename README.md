@@ -1,306 +1,453 @@
 # Debian Swap and BBR Setup
 
-一个用于 Debian 新服务器的 Swap 和标准 BBR 自动配置脚本。
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-脚本会检查现有配置，并以幂等方式完成设置。重复运行不会重复创建 Swap，也不会向 `/etc/fstab` 重复添加相同记录。
+A script that configures swap and the standard BBR congestion control on a fresh Debian server.
 
-## 功能
+The script inspects the current state and applies the configuration idempotently. Running it twice does not create a second swap file, and it never appends the same `/etc/fstab` entry twice. If an existing `/swapfile` is already enabled but the fstab entry is missing, the script adds it back.
 
-- 检查 root 权限
-- 检查当前系统是否为 Debian
-- 检查必要的系统命令
-- 保留服务器已有的 Swap
-- 没有 Swap 时自动创建 `/swapfile`
-- 根据物理内存自动选择 Swap 大小
-- 支持手动指定 1 至 32 GiB Swap
-- 检查磁盘空间
-- 创建 `/etc/fstab` 备份
-- 设置 `vm.swappiness=10`
-- 设置 `vm.vfs_cache_pressure=50`
-- 检查当前内核是否支持 BBR
-- 启用 `tcp_bbr`
-- 设置 `fq` 默认队列算法
-- 支持 LXC、OpenVZ 等容器环境检测
-- 支持重复运行
+## Features
 
-## 不会执行的操作
+- Check root privileges
+- Check that the system is Debian
+- Check the required system commands
+- Keep the swap that already exists on the server
+- Create `/swapfile` when no swap is enabled
+- Pick the swap size from the physical memory
+- Allow a manual swap size from 1 to 32 GiB
+- Detect the root filesystem type, including btrfs, ZFS and overlay
+- Check the free disk space
+- Back up `/etc/fstab` and handle a missing trailing newline
+- Set `vm.swappiness=10`
+- Set `vm.vfs_cache_pressure=50`
+- Check whether the running kernel provides BBR
+- Enable `tcp_bbr`
+- Set `fq` as the default queue discipline
+- Detect container environments such as LXC and OpenVZ
+- Verify the values that actually took effect instead of trusting exit codes
+- Support `--dry-run` for a read-only check
+- Support `--lang` for the output language
+- Stay idempotent
 
-本脚本不会：
+## What the script does not do
 
-- 修改 SSH 配置
-- 开启 root 密码登录
-- 修改防火墙
-- 开放任何端口
-- 安装 XanMod 内核
-- 安装其他第三方内核
-- 删除现有 Swap
-- 删除现有系统配置
-- 下载或执行其他远程脚本
+The script never:
 
-## 支持环境
+- Modifies the SSH configuration
+- Enables root password login
+- Modifies the firewall
+- Opens any port
+- Installs the XanMod kernel
+- Installs any other third-party kernel
+- Deletes the existing swap
+- Deletes existing system configuration
+- Downloads or executes remote scripts
 
-推荐环境：
+## Supported environment
+
+Recommended environment:
 
 - Debian 11
 - Debian 12
 - Debian 13
-- systemd 或常规 Debian VPS 环境
-- Debian 官方内核
+- systemd or a regular Debian VPS
+- The official Debian kernel
 
-架构方面，只要当前 Debian 内核提供 `tcp_bbr`，脚本即可配置 BBR。
+Any architecture works, as long as the running Debian kernel provides `tcp_bbr`.
 
-### 容器限制
+### Filesystem notes
 
-如果服务器实际是以下容器之一：
+| Root filesystem         | Swap file support                                                      |
+| ----------------------- | ---------------------------------------------------------------------- |
+| ext4 / xfs              | Supported, created with `fallocate`                                    |
+| btrfs                   | Supported, the script runs `chattr +C` first and then uses `dd`        |
+| ZFS                     | Not supported, the script exits with an error                          |
+| overlayfs / aufs        | Not supported (common in Docker), the script exits with an error       |
+| NFS / CIFS / 9p / FUSE  | Not supported, the script exits with an error                          |
+
+On btrfs the `chattr` command must be installed, otherwise the script refuses to create the swap file.
+
+### Container limits
+
+If the server is actually one of these containers:
 
 - OpenVZ
 - LXC
 - Docker
 - systemd-nspawn
 
-容器通常不能自行加载或更换宿主机内核模块。
+then it usually cannot load kernel modules or change the host kernel, and `swapon` is usually denied as well.
 
-这种情况下，只有宿主机已经启用并向容器提供 BBR 时，脚本才能成功配置 BBR。
+In that case the script can only succeed when the host already provides BBR to the container and the container allows swap. When `swapon` or `sysctl` fails the script reports the error and exits with a non-zero status instead of reporting an unapplied configuration as successful.
 
-## 默认 Swap 规则
+## Default swap size
 
-脚本默认按照物理内存决定 Swap 大小：
+The default size follows the physical memory:
 
-| 物理内存     | Swap 大小 |
-| ------------ | --------: |
-| 不超过 4 GiB |     2 GiB |
-| 超过 4 GiB   |     4 GiB |
+| Physical memory | Swap size |
+| --------------- | --------: |
+| Up to 4 GiB     |    2 GiB  |
+| Above 4 GiB     |    4 GiB  |
 
-如果系统已经启用了任何 Swap，脚本会保留现有 Swap，不再创建 `/swapfile`。
+If any swap is already enabled, the existing swap is kept and no new `/swapfile` is created.
 
-创建 Swap 前，脚本会检查根分区空间，并确保创建完成后至少保留 1 GiB 可用空间。
+Before creating the file the script checks the root filesystem and keeps at least 1 GiB free after creation. The check only runs when a new file really has to be created.
 
-## 使用方法
+## Usage
 
-### 方法一：克隆仓库
+### Option 1: clone the repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/debian-swap-bbr.git
+git clone https://github.com/Bosco1262/debian-swap-bbr.git
 cd debian-swap-bbr
-
-chmod +x setup-swap-bbr.sh
 sudo ./setup-swap-bbr.sh
 ```
 
-### 方法二：下载脚本后执行
+### Option 2: download the script first
 
-建议先下载并检查脚本内容：
+Downloading and reading the script before running it is recommended:
 
 ```bash
 curl -fsSLO \
-  https://raw.githubusercontent.com/YOUR_USERNAME/debian-swap-bbr/main/setup-swap-bbr.sh
+  https://raw.githubusercontent.com/Bosco1262/debian-swap-bbr/main/setup-swap-bbr.sh
 
 less setup-swap-bbr.sh
 ```
 
-确认无误后执行：
+Run it after reviewing:
 
 ```bash
 chmod +x setup-swap-bbr.sh
 sudo ./setup-swap-bbr.sh
 ```
 
-不建议使用下面这种未经检查就直接执行远程脚本的方式：
+Piping a remote script straight into a shell is not recommended:
 
 ```bash
 curl URL | bash
 ```
 
-## 指定 Swap 大小
+## Options
 
-例如创建 2 GiB Swap：
+```text
+--swap-size N    Swap size in GiB, 1 to 32, --swap-size=N also works
+-l, --lang LANG  Output language: en or zh-CN
+                 Defaults to the system locale, English as the fallback
+-n, --dry-run    Check the environment and print the plan, change nothing
+-h, --help       Show the help text
+-V, --version    Show the script version
+```
+
+Create a 2 GiB swap:
 
 ```bash
 sudo ./setup-swap-bbr.sh --swap-size 2
 ```
 
-创建 4 GiB Swap：
+Create a 4 GiB swap:
 
 ```bash
-sudo ./setup-swap-bbr.sh --swap-size 4
+sudo ./setup-swap-bbr.sh --swap-size=4
 ```
 
-允许范围为 1 至 32 GiB：
+`--swap-size` never overrides an existing swap.
+
+### Output language
+
+The output language follows a fixed priority:
+
+1. An explicit `-l`, `--lang` or `--language` value, either `en` or `zh-CN`.
+2. The system locale (`LC_ALL`, `LC_MESSAGES`, `LANG`).
+3. English as the guaranteed fallback.
 
 ```bash
-sudo ./setup-swap-bbr.sh --swap-size 8
+sudo ./setup-swap-bbr.sh --lang en         # force English
+sudo ./setup-swap-bbr.sh --lang zh-CN      # force Chinese
+LANG=zh_CN.UTF-8 sudo ./setup-swap-bbr.sh  # follow the system
 ```
 
-如果服务器已经启用了 Swap，`--swap-size` 不会覆盖现有 Swap。
+`--lang` only affects terminal output, including `--help` and error messages. The files written to `/etc/sysctl.d` always keep the English keys with bilingual comments, regardless of the output language.
 
-## 查看帮助
+### Dry run
+
+Run a check first on a new server:
+
+```bash
+sudo ./setup-swap-bbr.sh --dry-run
+```
+
+`--dry-run` performs the system detection, command checks, filesystem check, disk space check and BBR support check, but it creates no file, writes no fstab entry and changes no sysctl value.
+
+## Help and version
 
 ```bash
 ./setup-swap-bbr.sh --help
+./setup-swap-bbr.sh --version
 ```
 
-## 验证 Swap
+## Verifying swap
 
 ```bash
 swapon --show
 free -h
 ```
 
-查看 Swap 参数：
+Inspect the swap tunables:
 
 ```bash
 sysctl vm.swappiness
 sysctl vm.vfs_cache_pressure
 ```
 
-预期结果：
+Expected result:
 
 ```text
 vm.swappiness = 10
 vm.vfs_cache_pressure = 50
 ```
 
-## 验证 BBR
+The script runs the same verification before it exits and returns a non-zero status when a value did not take effect.
 
-检查可用拥塞控制算法：
+## Verifying BBR
+
+Available congestion control algorithms:
 
 ```bash
 sysctl net.ipv4.tcp_available_congestion_control
 ```
 
-检查当前拥塞控制算法：
+Current congestion control algorithm:
 
 ```bash
 sysctl net.ipv4.tcp_congestion_control
 ```
 
-检查默认队列算法：
+Default queue discipline:
 
 ```bash
 sysctl net.core.default_qdisc
 ```
 
-预期结果：
+Expected result:
 
 ```text
 net.ipv4.tcp_congestion_control = bbr
 net.core.default_qdisc = fq
 ```
 
-检查 BBR 模块：
+BBR module:
 
 ```bash
 lsmod | grep tcp_bbr
 ```
 
-部分内核可能将 BBR直接编译进内核，因此即使 `lsmod` 不显示模块，只要当前拥塞控制算法为 `bbr`，BBR 仍可能已经正常启用。
+Some kernels compile BBR into the kernel itself, so `lsmod` may not list the module even though `bbr` is the active congestion control algorithm.
 
-## 配置文件
+## Configuration files
 
-脚本会管理以下文件：
+The script manages these files:
 
 ```text
 /swapfile
-/etc/sysctl.d/90-local-swap.conf
-/etc/sysctl.d/90-local-bbr.conf
+/etc/sysctl.d/99-zz-local-swap.conf
+/etc/sysctl.d/99-zz-local-bbr.conf
 /etc/modules-load.d/bbr.conf
 ```
 
-如果脚本需要修改 `/etc/fstab`，会先创建带时间戳的备份：
+The file names deliberately sort after `99-sysctl.conf`, which on Debian is a symlink to `/etc/sysctl.conf`, so the values are not overridden at boot. The script also reports conflicting keys found in `/etc/sysctl.conf`.
+
+When `tcp_bbr` is built into the kernel, the script skips `/etc/modules-load.d/bbr.conf` to avoid a "module not found" message at boot.
+
+When `/etc/fstab` has to be modified, a timestamped backup is created first:
 
 ```text
 /etc/fstab.bak.YYYYMMDD-HHMMSS
 ```
 
-## 手动卸载
+### Upgrading from an older version
 
-### 删除脚本创建的 Swap
+Older versions used `90-local-*.conf`. The script only deletes those files when their first line contains the `Managed by debian-swap-bbr` marker; anything else is kept and reported.
 
-首先确认 `/swapfile` 是由本脚本创建并且不再需要：
+## Idempotency and failure handling
+
+- Swap already enabled: kept as is, no new file is created
+- `/swapfile` exists but is not enabled: verified with `blkid` before it is enabled
+- `/swapfile` enabled but the fstab entry is missing: the entry is added back
+- fstab entry already present, whether it uses `none` or `swap` as the mount point: no duplicate is appended
+- Failure during creation: the `/swapfile` created by this run but never enabled is removed
+- Failure of a critical command: the script returns a non-zero status instead of printing "configuration completed"
+
+## Troubleshooting
+
+| Symptom                                                              | Cause and fix                                                                              |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `swapon: /swapfile: Operation not permitted`                          | The container disallows swapon, configure swap on the host instead                         |
+| `swapon: /swapfile: Invalid argument`                                 | btrfs CoW not disabled, unsupported filesystem, or a sparse file                           |
+| `The script requires at least 1024 MiB free space after creation`      | Not enough free space, clean up the disk or use a smaller `--swap-size`                    |
+| `This kernel does not provide BBR`                                    | The kernel lacks BBR or the container does not expose it, the script installs no kernel    |
+| `Verification failed: net.ipv4.tcp_congestion_control`                | A conflicting key in `/etc/sysctl.conf`, or a restricted container                         |
+| `/swapfile exists but cannot be confirmed as a swap file`             | The script refuses to overwrite it, review the file yourself                               |
+| `env: 'bash\r': No such file or directory`                            | The script carries Windows CRLF line endings, run `sed -i 's/\r$//' setup-swap-bbr.sh`     |
+
+The failing line and exit code are taken from the `Script failed at line N with exit code M` message.
+
+### Transferring the script from Windows
+
+Copying the script from a Windows machine can turn the line endings into CRLF and break execution. Check it after the transfer:
+
+```bash
+head -n 1 setup-swap-bbr.sh | cat -A
+```
+
+The expected output is `#!/usr/bin/env bash$`. If the line ends with `^M$`, convert the file:
+
+```bash
+sed -i 's/\r$//' setup-swap-bbr.sh
+```
+
+The repository ships a `.gitattributes` that forces LF for `.sh`, `.md` and `.yml`, so a `git clone` is never affected.
+
+## Manual removal
+
+### Removing the swap created by the script
+
+First make sure `/swapfile` was created by this script and is no longer needed:
 
 ```bash
 sudo swapoff /swapfile
 ```
 
-从 `/etc/fstab` 中删除 `/swapfile` 对应行：
+Remove the entry from `/etc/fstab`:
 
 ```bash
 sudo sed -i '\|^/swapfile[[:space:]]|d' /etc/fstab
 ```
 
-删除 Swap 文件和参数配置：
+Remove the swap file and its tunables:
 
 ```bash
 sudo rm -f /swapfile
-sudo rm -f /etc/sysctl.d/90-local-swap.conf
+sudo rm -f /etc/sysctl.d/99-zz-local-swap.conf
 ```
 
-重新加载 sysctl：
+Reload sysctl:
 
 ```bash
 sudo sysctl --system
 ```
 
-不要使用 `swapoff -a`，因为它会关闭服务器上的所有 Swap。
+Do not use `swapoff -a`, it disables every swap device on the server.
 
-### 删除 BBR 配置
+### Removing the BBR configuration
 
 ```bash
-sudo rm -f /etc/sysctl.d/90-local-bbr.conf
+sudo rm -f /etc/sysctl.d/99-zz-local-bbr.conf
 sudo rm -f /etc/modules-load.d/bbr.conf
 ```
 
-删除配置文件不会自动选择其他拥塞控制算法。
+Removing the files does not select another congestion control algorithm.
 
-如果需要立即恢复 Debian 常用的 `cubic`：
+To switch back to the Debian default `cubic` right away:
 
 ```bash
 sudo sysctl -w net.ipv4.tcp_congestion_control=cubic
 sudo sysctl -w net.core.default_qdisc=fq_codel
 ```
 
-然后重新加载配置：
+Then reload the configuration:
 
 ```bash
 sudo sysctl --system
 ```
 
-## 开发检查
+## Development checks
 
-### 使用 ShellCheck
+### ShellCheck
 
-在 Debian 上安装 ShellCheck：
+Install ShellCheck on Debian:
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y shellcheck
 ```
 
-检查脚本：
+Run it:
 
 ```bash
 shellcheck setup-swap-bbr.sh
 ```
 
-### 检查 Bash 语法
+The `.shellcheckrc` in the repository root disables `SC2310` and `SC2311`: every function handles its own failures explicitly and does not rely on `set -e` inside condition contexts.
+
+### Bash syntax check
 
 ```bash
 bash -n setup-swap-bbr.sh
 ```
 
-## 安全说明
+### Code comment convention
 
-在生产服务器上运行任何 root 脚本之前，应先完成以下检查：
+Comments are bilingual, English first and Simplified Chinese second, and follow these spacing rules:
 
-1. 阅读完整脚本内容。
-2. 检查脚本是否下载或执行其他远程代码。
-3. 检查脚本修改的系统文件。
-4. 检查仓库的提交历史和 Release。
-5. 先在测试服务器或快照环境中运行。
-6. VPS 支持快照时，应先在 AWS EC2、Google Compute Engine、DigitalOcean、Vultr 或对应云平台创建快照。
+```bash
+# 单个英文注释行与对应的中文注释行之间不留空行。
+# 单行注释的两种注释间不需要空行。
 
-本脚本只处理 Swap 和标准 BBR，不会配置 SSH、防火墙或第三方内核。
+# A blank line must be left between
+# single-block, multi-line comments.
+#
+# 在单段多行注释之间
+# 必须留出一个空行。
 
-## License
+# This is a multi-line comment spanning multiple sections.
+#
+# Two blank lines must be left between comments in the two languages.
+#
+#
+# 这是一个多段多行注释。
+#
+# 在两种语言的注释之间，必须留出两个空行。
+```
 
-本项目使用 MIT License。
+In short:
+
+1. A single English line and its Chinese line sit next to each other, no blank comment line in between.
+2. A single-block multi-line comment uses one blank comment line (`#`) between the two languages.
+3. A comment with several sections uses one blank comment line between sections and two blank comment lines between the two languages.
+
+Comments written into `/etc/sysctl.d` files are bilingual as well, while the keys and values never depend on the output language.
+
+### Suggested local checks
+
+```bash
+# Argument parsing
+sudo ./setup-swap-bbr.sh --swap-size 08     # must be treated as 8 GiB
+sudo ./setup-swap-bbr.sh --swap-size 33     # must exit with 2
+sudo ./setup-swap-bbr.sh --swap-size        # must exit with 2
+sudo ./setup-swap-bbr.sh --lang fr          # must exit with 2
+
+# Language resolution
+sudo ./setup-swap-bbr.sh --lang en --help   # English help
+sudo ./setup-swap-bbr.sh --lang zh-CN --help # Chinese help
+
+# Idempotency: run twice, fstab must still contain a single /swapfile line
+sudo ./setup-swap-bbr.sh && sudo ./setup-swap-bbr.sh
+grep -c '^/swapfile' /etc/fstab
+```
+
+## Security notes
+
+Before running any root script on a production server:
+
+1. Read the whole script.
+2. Check whether it downloads or executes remote code.
+3. Check which system files it modifies.
+4. Check the commit history and releases of the repository.
+5. Run it on a test server or a snapshot first.
+6. Create a snapshot in AWS EC2, Google Compute Engine, DigitalOcean, Vultr or the matching cloud platform when available.
+
+The script only handles swap and the standard BBR configuration, it never touches SSH, the firewall or third-party kernels.
+
+# License
+
+This project is licensed under the [MIT License](LICENSE).
