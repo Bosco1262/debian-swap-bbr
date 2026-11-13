@@ -134,6 +134,8 @@ curl URL | bash
 -l, --lang LANG  Output language: en or zh-CN
                  Defaults to the system locale, English as the fallback
 -n, --dry-run    Check the environment and print the plan, change nothing
+--restore        Remove what this script created and return to the previous state
+                 Combine with --dry-run to only print the plan
 -h, --help       Show the help text
 -V, --version    Show the script version
 ```
@@ -252,7 +254,10 @@ The script manages these files:
 /etc/sysctl.d/99-zz-local-swap.conf
 /etc/sysctl.d/99-zz-local-bbr.conf
 /etc/modules-load.d/bbr.conf
+/var/lib/debian-swap-bbr/state
 ```
+
+`/var/lib/debian-swap-bbr/state` is the install record, `--restore` uses it to decide whether a change was made by this script.
 
 The file names deliberately sort after `99-sysctl.conf`, which on Debian is a symlink to `/etc/sysctl.conf`, so the values are not overridden at boot. The script also reports conflicting keys found in `/etc/sysctl.conf`.
 
@@ -276,6 +281,41 @@ Older versions used `90-local-*.conf`. The script only deletes those files when 
 - fstab entry already present, whether it uses `none` or `swap` as the mount point: no duplicate is appended
 - Failure during creation: the `/swapfile` created by this run but never enabled is removed
 - Failure of a critical command: the script returns a non-zero status instead of printing "configuration completed"
+
+## Restoring the original state
+
+The script writes an install record to `/var/lib/debian-swap-bbr/state`. It stores which change was made by the script and the values of `vm.swappiness`, `vm.vfs_cache_pressure`, the congestion control algorithm and the queue discipline from before the change.
+
+```bash
+sudo ./setup-swap-bbr.sh --restore --dry-run   # preview only
+sudo ./setup-swap-bbr.sh --restore             # apply
+```
+
+The restore runs in dependency order:
+
+1. `swapoff /swapfile`, only when the record says this script enabled it
+2. Remove `/swapfile`, only when the record says this script created it; an existing file is always kept
+3. Remove the exact line this script wrote from `/etc/fstab` (backed up first)
+4. `systemctl daemon-reload`
+5. Remove `99-zz-local-*.conf` and `modules-load.d/bbr.conf` when they carry the script marker
+6. Move the legacy `90-local-*.conf` files back from the backup directory
+7. Restore the four kernel parameters from the values stored in the record
+
+The restore never:
+
+- Deletes a `/swapfile` it did not create
+- Touches an fstab entry it did not write
+- Deletes a configuration file without the script marker
+- Unloads the `tcp_bbr` module, it disappears after the next reboot
+- Touches SSH, the firewall or the kernel
+
+Behaviour details:
+
+- `--restore --dry-run` prints the plan and changes nothing
+- A failing `swapoff` (out of memory) aborts the restore and keeps both `/swapfile` and the install record, so it can be retried later
+- The restore is idempotent, a second run returns 0
+- `--restore` and `--swap-size` are mutually exclusive, using both returns exit code 2
+- Without an install record (for example an installation made by 1.0–1.2) only the marker files are removed, `/swapfile` and fstab are left untouched with a warning
 
 ## Troubleshooting
 
@@ -307,7 +347,9 @@ sed -i 's/\r$//' setup-swap-bbr.sh
 
 The repository ships a `.gitattributes` that forces LF for `.sh`, `.md` and `.yml`, so a `git clone` is never affected.
 
-## Manual removal
+## Manual removal (fallback)
+
+Prefer `sudo ./setup-swap-bbr.sh --restore`. The steps below are for machines without an install record, or when a single file has to be handled manually.
 
 ### Removing the swap created by the script
 
@@ -433,6 +475,11 @@ sudo ./setup-swap-bbr.sh --lang zh-CN --help # Chinese help
 # Idempotency: run twice, fstab must still contain a single /swapfile line
 sudo ./setup-swap-bbr.sh && sudo ./setup-swap-bbr.sh
 grep -c '^/swapfile' /etc/fstab
+
+# Restore
+sudo ./setup-swap-bbr.sh --restore --dry-run        # print the plan only
+sudo ./setup-swap-bbr.sh --restore                  # undo what the script created
+sudo ./setup-swap-bbr.sh --restore --swap-size 2    # must exit with 2
 ```
 
 ## Security notes

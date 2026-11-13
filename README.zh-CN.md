@@ -135,6 +135,8 @@ curl URL | bash
 -l, --lang LANG  输出语言：en 或 zh-CN
                  默认跟随系统 locale，无法识别时回退英文
 -n, --dry-run    只检查环境并输出计划，不修改任何文件
+--restore        撤销本脚本创建的配置，恢复到安装前的状态
+                 与 --dry-run 同时使用只输出计划
 -h, --help       显示帮助信息
 -V, --version    显示脚本版本
 ```
@@ -253,7 +255,10 @@ lsmod | grep tcp_bbr
 /etc/sysctl.d/99-zz-local-swap.conf
 /etc/sysctl.d/99-zz-local-bbr.conf
 /etc/modules-load.d/bbr.conf
+/var/lib/debian-swap-bbr/state
 ```
+
+其中 `/var/lib/debian-swap-bbr/state` 是安装状态清单，`--restore` 依赖它判断每一项改动是否由脚本完成。
 
 文件名刻意排在 `99-sysctl.conf`（在 Debian 上是指向 `/etc/sysctl.conf` 的软链）之后，避免开机时被 `/etc/sysctl.conf` 中的同名键覆盖。脚本启动时也会提示 `/etc/sysctl.conf` 中是否存在冲突的同名键。
 
@@ -277,6 +282,41 @@ lsmod | grep tcp_bbr
 - fstab 已有 `/swapfile` 条目（无论挂载点写 `none` 还是 `swap`）：不会重复追加
 - 创建过程中失败：脚本会删除本次创建但未能启用的 `/swapfile`，避免留下无效文件
 - 关键命令失败：立即返回非 0 退出码，而不是继续打印"配置完成"
+
+## 恢复（--restore）
+
+脚本会在安装时写入状态清单 `/var/lib/debian-swap-bbr/state`，记录每一项改动是否由脚本完成，并保存改动前的 `vm.swappiness`、`vm.vfs_cache_pressure`、拥塞控制算法和队列算法。
+
+```bash
+sudo ./setup-swap-bbr.sh --restore --dry-run   # 只预览，不改动
+sudo ./setup-swap-bbr.sh --restore             # 正式恢复
+```
+
+恢复按依赖顺序执行：
+
+1. `swapoff /swapfile`（只有清单记录"由脚本启用"时才执行）
+2. 删除 `/swapfile`（只有清单记录"由脚本创建"时才执行，已有文件一律保留）
+3. 从 `/etc/fstab` 删除由脚本写入的那一行（精确匹配，删除前备份）
+4. `systemctl daemon-reload`
+5. 删除带脚本标记的 `99-zz-local-*.conf` 与 `modules-load.d/bbr.conf`
+6. 把旧版本 `90-local-*.conf` 从备份目录放回原位
+7. 用清单记录的旧值恢复 4 个内核参数
+
+恢复**不会**做这些事：
+
+- 不删除不是本脚本创建的 `/swapfile`
+- 不修改不是本脚本写入的 fstab 条目
+- 不删除没有本脚本标记的配置文件
+- 不卸载 `tcp_bbr` 模块（重启后自然消失）
+- 不动 SSH、防火墙、内核
+
+行为细节：
+
+- `--restore --dry-run` 只打印计划，不产生任何改动
+- `swapoff` 失败（内存不足）时立即中止，`/swapfile` 与状态清单都保留，可稍后重试
+- 恢复是幂等的，重复执行返回 0
+- `--restore` 与 `--swap-size` 互斥，同时使用返回退出码 2
+- 找不到状态清单时（例如由 1.0–1.2 安装），只删除带标记的配置文件，`/swapfile` 与 fstab 保持原样并给出提示
 
 ## 故障排查
 
@@ -308,7 +348,9 @@ sed -i 's/\r$//' setup-swap-bbr.sh
 
 仓库已通过 `.gitattributes` 强制 `.sh` / `.md` / `.yml` 使用 LF，用 `git clone` 获取的文件不会出现该问题。
 
-## 手动卸载
+## 手动卸载（兜底）
+
+优先使用 `sudo ./setup-swap-bbr.sh --restore`。下面的步骤适用于没有状态清单、或需要单独处理某个文件的场景。
 
 ### 删除脚本创建的 Swap
 
@@ -434,6 +476,11 @@ sudo ./setup-swap-bbr.sh --lang zh-CN --help # 中文帮助
 # 幂等性：连续执行两次，fstab 只应出现一行 /swapfile
 sudo ./setup-swap-bbr.sh && sudo ./setup-swap-bbr.sh
 grep -c '^/swapfile' /etc/fstab
+
+# 恢复
+sudo ./setup-swap-bbr.sh --restore --dry-run        # 只打印计划
+sudo ./setup-swap-bbr.sh --restore                  # 撤销脚本创建的配置
+sudo ./setup-swap-bbr.sh --restore --swap-size 2    # 应退出码 2
 ```
 
 ## 安全说明
