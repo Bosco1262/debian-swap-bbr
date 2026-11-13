@@ -26,6 +26,7 @@
 - 支持 LXC、OpenVZ 等容器环境检测
 - 配置完成后校验实际生效值，而不是只相信命令返回值
 - 支持 `--dry-run` 预检
+- 支持 `--restore` 精确撤销本脚本创建的配置
 - 支持 `--lang` 切换输出语言
 - 支持重复运行
 
@@ -135,7 +136,8 @@ curl URL | bash
 -l, --lang LANG  输出语言：en 或 zh-CN
                  默认跟随系统 locale，无法识别时回退英文
 -n, --dry-run    只检查环境并输出计划，不修改任何文件
---restore        撤销本脚本创建的配置，恢复到安装前的状态
+--restore, --uninstall
+                 撤销本脚本创建的配置，恢复到安装前的状态
                  与 --dry-run 同时使用只输出计划
 -h, --help       显示帮助信息
 -V, --version    显示脚本版本
@@ -258,7 +260,7 @@ lsmod | grep tcp_bbr
 /var/lib/debian-swap-bbr/state
 ```
 
-其中 `/var/lib/debian-swap-bbr/state` 是安装状态清单，`--restore` 依赖它判断每一项改动是否由脚本完成。
+其中 `/var/lib/debian-swap-bbr/state` 是安装状态清单，`--restore` 依赖它判断每一项改动是否由脚本完成。`/var/lib/debian-swap-bbr/backup.*` 只在需要备份时出现：旧版本配置迁移、或目标路径上原本就有用户自己的同名文件。
 
 文件名刻意排在 `99-sysctl.conf`（在 Debian 上是指向 `/etc/sysctl.conf` 的软链）之后，避免开机时被 `/etc/sysctl.conf` 中的同名键覆盖。脚本启动时也会提示 `/etc/sysctl.conf` 中是否存在冲突的同名键。
 
@@ -314,6 +316,8 @@ sudo ./setup-swap-bbr.sh --restore             # 正式恢复
 
 - `--restore --dry-run` 只打印计划，不产生任何改动
 - `swapoff` 失败（内存不足）时立即中止，`/swapfile` 与状态清单都保留，可稍后重试
+- 恢复结束前会复查真实状态（Swap 是否已关闭、fstab 是否干净、4 个内核参数是否回到旧值），任一项不符都会保留状态清单并返回非 0
+- 安装时如果目标路径上已有用户自己的同名配置文件，会先移入 `/var/lib/debian-swap-bbr/backup.*`，恢复时放回；若放回时该路径已有更新的文件，则保留备份并提示手动处理
 - 恢复是幂等的，重复执行返回 0
 - `--restore` 与 `--swap-size` 互斥，同时使用返回退出码 2
 - 找不到状态清单时（例如由 1.0–1.2 安装），只删除带标记的配置文件，`/swapfile` 与 fstab 保持原样并给出提示
@@ -433,7 +437,7 @@ bash -n setup-swap-bbr.sh
 脚本内的注释使用英文与简体中文双语，并遵循以下排版规则：
 
 ```bash
-# 单个英文注释行与对应的中文注释行之间不留空行。
+# No blank line is needed between two single-line comments.
 # 单行注释的两种注释间不需要空行。
 
 # A blank line must be left between

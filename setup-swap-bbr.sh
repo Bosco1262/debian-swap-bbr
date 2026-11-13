@@ -11,8 +11,8 @@
 #   3. Create /swapfile when no swap is enabled.
 #   4. Pick the swap size from physical memory.
 #   5. Enable the standard BBR shipped with the Debian kernel.
-#   6. Stay idempotent, running it twice changes nothing twice.
-#   7. Support --dry-run and --lang.
+#   6. Stay idempotent, a second run never duplicates configuration.
+#   7. Support --dry-run, --restore and --lang.
 #
 # What this script does not do:
 #   1. Touch the SSH configuration.
@@ -27,8 +27,8 @@
 #   3. 没有 Swap 时创建 /swapfile。
 #   4. 根据物理内存决定 Swap 大小。
 #   5. 启用 Debian 内核自带的标准 BBR。
-#   6. 保持幂等，重复执行不会重复改动。
-#   7. 支持 --dry-run 与 --lang。
+#   6. 保持幂等，重复执行不会产生重复配置（结果幂等）。
+#   7. 支持 --dry-run、--restore 与 --lang。
 #
 # 本脚本不会做的事情：
 #   1. 修改 SSH 配置。
@@ -42,7 +42,7 @@ set -Eeuo pipefail
 umask 022
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.3.0"
+readonly SCRIPT_VERSION="1.3.1"
 readonly SWAPFILE="/swapfile"
 readonly FSTAB="/etc/fstab"
 readonly SYSCTL_DIR="/etc/sysctl.d"
@@ -86,7 +86,7 @@ MF_FSTAB_ADDED=0
 MF_SWAP_CONFIG=0
 MF_BBR_CONFIG=0
 MF_MODULE_CONFIG=0
-MF_LEGACY_BACKUP=""
+MF_BACKUP_DIR=""
 MF_PREV_VALUES_OK=0
 MF_PREV_SWAPPINESS=""
 MF_PREV_VFS_CACHE_PRESSURE=""
@@ -118,7 +118,8 @@ Options:
   -l, --lang LANG   Output language: en or zh-CN
                     Defaults to the system locale, English as fallback
   -n, --dry-run     Check the environment and print the plan, change nothing
-  --restore         Remove what this script created and return to the previous state
+  --restore, --uninstall
+                    Remove what this script created and return to the previous state
                     Combine with --dry-run to only print the plan
   -h, --help        Show this help
   -V, --version     Show the script version
@@ -162,6 +163,7 @@ Note:
     [err_fstype_detail]='Containers, union filesystems and network filesystems cannot use %s.'
     [err_fstype_hint]='Use a block device or a swap provided by the host instead.'
     [info_btrfs_cow]='btrfs requires CoW to be disabled, chattr +C and dd will be used.'
+    [warn_fstype_unknown]='Cannot determine the root filesystem type, using the default creation method.'
     [err_chattr_missing]='chattr is missing, cannot create a safe swap file on btrfs.'
     [err_chattr_hint]='Try: apt-get install -y e2fsprogs'
     [err_df_failed]='Cannot read the free space of the root filesystem.'
@@ -201,8 +203,8 @@ Note:
     [warn_sysctl_after_swap]='Swap is enabled but kernel parameters could not be written.'
     [ok_swap_configured]='Swap configuration completed.'
     [warn_legacy_foreign]='%s was not created by this script, it will not be deleted. Please review it manually.'
-    [dryrun_delete_legacy]='[DRY-RUN] Would delete the legacy config %s.'
-    [dryrun_restore_legacy]='[DRY-RUN] Would restore %s from the backup.'
+    [dryrun_delete_legacy]='[DRY-RUN] Would move the legacy config %s to the backup directory.'
+    [dryrun_restore_backup]='[DRY-RUN] Would restore %s from the backup.'
     [ok_deleted_legacy]='Deleted the legacy config %s.'
     [warn_delete_legacy_failed]='Cannot delete the legacy config %s, please review it manually.'
     [warn_container]='Container environment detected: %s'
@@ -218,7 +220,7 @@ Note:
     [info_bbr_builtin]='tcp_bbr appears to be built into the kernel, skipping %s.'
     [ok_bbr_written]='Standard BBR configuration written.'
     [warn_sysctl_conflict]='%s also defines %s, please make sure the values match this script.'
-    [warn_sysctl_order]='This script writes files that sort after 99-sysctl.conf, so its settings win at boot.'
+    [warn_sysctl_order]='A file sorting after the script configuration can still override these values at boot.'
     [err_verify_no_swap]='Verification failed: no swap is currently enabled.'
     [err_verify_value]='Verification failed: %s should be %s but is %s.'
     [err_verify_hint]='Check whether /etc/sysctl.conf or other files override %s.'
@@ -258,8 +260,10 @@ Note:
     [result_swapfile_none]='Swap file: none (existing swap is used)'
     [result_swap_ok]='Swap: success'
     [result_swap_fail]='Swap: incomplete'
+    [result_swap_plan]='Swap: would be configured'
     [result_bbr_ok]='BBR: success'
     [result_bbr_fail]='BBR: incomplete'
+    [result_bbr_plan]='BBR: would be configured'
     [result_state_file]='Install record: %s'
     [err_restore_conflict]='--restore cannot be combined with %s.'
     [restore_start]='Restoring: undoing the configuration created by this script.'
@@ -271,6 +275,8 @@ Note:
     [ok_swapfile_removed]='Removed %s.'
     [dryrun_remove_file]='[DRY-RUN] Would remove %s.'
     [err_remove_file]='Cannot remove %s.'
+    [err_tempfile]='Cannot create a temporary file next to %s.'
+    [err_fstab_empty]='Refusing to write an empty %s, nothing was changed.'
     [info_file_absent]='%s is not present, nothing to do.'
     [warn_file_not_ours]='%s was not created by this script, it is left untouched.'
     [ok_fstab_line_removed]='Updated %s: removed the %s entry.'
@@ -279,13 +285,18 @@ Note:
     [dryrun_fstab_remove]='[DRY-RUN] Would update %s: remove the %s entry.'
     [ok_daemon_reload]='systemd units reloaded.'
     [warn_daemon_reload]='systemctl daemon-reload failed, run it manually.'
-    [ok_legacy_restored]='Restored %s from the backup.'
+    [ok_restore_backup]='Restored %s from the backup.'
+    [ok_backup_foreign_file]='Backed up the existing %s to %s.'
+    [dryrun_backup_file]='[DRY-RUN] Would back up the existing %s before overwriting it.'
     [warn_legacy_exists]='%s already exists, the backup is kept for manual restore.'
-    [warn_legacy_backup_missing]='The legacy backup %s is missing, nothing to restore.'
+    [warn_legacy_backup_missing]='The backup directory %s is missing, nothing to restore.'
+    [warn_backup_remaining]='Backups remain in %s, restore them manually.'
     [info_prev_restored]='Restored %s to %s.'
     [warn_prev_unknown]='Previous values were not recorded, kernel parameters stay as they are and return to system defaults after a reboot.'
     [warn_sysctl_restore_failed]='Cannot restore %s, set it manually.'
     [dryrun_sysctl]='[DRY-RUN] Would set %s to %s.'
+    [err_verify_swap_active]='Verification failed: %s is still enabled.'
+    [err_verify_fstab]='Verification failed: %s still contains the %s entry.'
     [warn_module_loaded]='The tcp_bbr module stays loaded until the next reboot.'
     [ok_restore_done]='Restore completed.'
     [err_restore_failed]='Restore did not complete, the install record is kept for a retry.'
@@ -304,7 +315,8 @@ declare -A MSG_ZH=(
   -l, --lang LANG   输出语言：en 或 zh-CN
                     默认跟随系统 locale，无法识别时回退英文
   -n, --dry-run     只检查环境并输出计划，不修改任何内容
-  --restore         撤销本脚本创建的配置，恢复到安装前的状态
+  --restore, --uninstall
+                    撤销本脚本创建的配置，恢复到安装前的状态
                     与 --dry-run 同时使用只输出计划
   -h, --help        显示帮助信息
   -V, --version     显示脚本版本
@@ -348,6 +360,7 @@ declare -A MSG_ZH=(
     [err_fstype_detail]='容器、联合文件系统和网络文件系统无法使用 %s。'
     [err_fstype_hint]='如需 Swap，请改用块设备或宿主机上的 Swap。'
     [info_btrfs_cow]='btrfs 需要关闭 CoW，创建时将使用 chattr +C 与 dd。'
+    [warn_fstype_unknown]='无法识别根分区文件系统类型，将按默认方式尝试创建。'
     [err_chattr_missing]='缺少 chattr 命令，无法在 btrfs 上安全创建 Swap 文件。'
     [err_chattr_hint]='可尝试执行：apt-get install -y e2fsprogs'
     [err_df_failed]='无法读取根分区可用空间。'
@@ -387,8 +400,8 @@ declare -A MSG_ZH=(
     [warn_sysctl_after_swap]='Swap 已经启用，但内核参数写入失败。'
     [ok_swap_configured]='Swap 配置完成。'
     [warn_legacy_foreign]='%s 不是本脚本创建的文件，脚本不会删除，请自行确认。'
-    [dryrun_delete_legacy]='[DRY-RUN] 将删除旧版本配置 %s。'
-    [dryrun_restore_legacy]='[DRY-RUN] 将从备份恢复 %s。'
+    [dryrun_delete_legacy]='[DRY-RUN] 将把旧版本配置 %s 移动到备份目录。'
+    [dryrun_restore_backup]='[DRY-RUN] 将从备份恢复 %s。'
     [ok_deleted_legacy]='已经删除旧版本配置 %s。'
     [warn_delete_legacy_failed]='无法删除旧版本配置 %s，请手动处理。'
     [warn_container]='检测到容器环境：%s'
@@ -404,7 +417,7 @@ declare -A MSG_ZH=(
     [info_bbr_builtin]='tcp_bbr 似乎已经内置在内核中，跳过 %s。'
     [ok_bbr_written]='标准 BBR 配置已经写入。'
     [warn_sysctl_conflict]='%s 中也设置了 %s，请确认取值与本脚本一致。'
-    [warn_sysctl_order]='本脚本的配置文件排序在 99-sysctl.conf 之后，开机时会以脚本设置为准。'
+    [warn_sysctl_order]='排序在脚本配置之后的文件仍可能在开机时覆盖这些取值。'
     [err_verify_no_swap]='校验失败：当前没有任何已启用的 Swap。'
     [err_verify_value]='校验失败：%s 期望 %s，实际 %s。'
     [err_verify_hint]='请检查 /etc/sysctl.conf 等文件是否覆盖了 %s。'
@@ -444,8 +457,10 @@ declare -A MSG_ZH=(
     [result_swapfile_none]='Swap 文件：未使用（沿用现有 Swap）'
     [result_swap_ok]='Swap 配置：成功'
     [result_swap_fail]='Swap 配置：未完成'
+    [result_swap_plan]='Swap 配置：将进行配置'
     [result_bbr_ok]='BBR 配置：成功'
     [result_bbr_fail]='BBR 配置：未完成'
+    [result_bbr_plan]='BBR 配置：将进行配置'
     [result_state_file]='安装记录：%s'
     [err_restore_conflict]='--restore 不能与 %s 同时使用。'
     [restore_start]='开始恢复：撤销由本脚本创建的配置。'
@@ -457,6 +472,8 @@ declare -A MSG_ZH=(
     [ok_swapfile_removed]='已删除 %s。'
     [dryrun_remove_file]='[DRY-RUN] 将删除 %s。'
     [err_remove_file]='无法删除 %s。'
+    [err_tempfile]='无法在 %s 所在目录创建临时文件。'
+    [err_fstab_empty]='拒绝写入空的 %s，未做任何修改。'
     [info_file_absent]='%s 不存在，无需处理。'
     [warn_file_not_ours]='%s 不是本脚本创建的文件，保持原样。'
     [ok_fstab_line_removed]='已更新 %s：移除了 %s 条目。'
@@ -465,13 +482,18 @@ declare -A MSG_ZH=(
     [dryrun_fstab_remove]='[DRY-RUN] 将更新 %s：移除 %s 条目。'
     [ok_daemon_reload]='已重新加载 systemd 单元。'
     [warn_daemon_reload]='systemctl daemon-reload 执行失败，请手动执行。'
-    [ok_legacy_restored]='已从备份恢复 %s。'
+    [ok_restore_backup]='已从备份恢复 %s。'
+    [ok_backup_foreign_file]='已把原有的 %s 备份到 %s。'
+    [dryrun_backup_file]='[DRY-RUN] 将先把原有的 %s 备份起来再覆盖。'
     [warn_legacy_exists]='%s 已存在，备份保留，请手动处理。'
-    [warn_legacy_backup_missing]='旧版本备份 %s 不存在，无需恢复。'
+    [warn_legacy_backup_missing]='备份目录 %s 不存在，无需恢复。'
+    [warn_backup_remaining]='%s 中仍有备份文件，请手动处理。'
     [info_prev_restored]='已将 %s 恢复为 %s。'
     [warn_prev_unknown]='未记录原始取值，内核参数保持当前值，重启后会回到系统默认。'
     [warn_sysctl_restore_failed]='无法恢复 %s，请手动设置。'
     [dryrun_sysctl]='[DRY-RUN] 将把 %s 设置为 %s。'
+    [err_verify_swap_active]='校验失败：%s 仍处于启用状态。'
+    [err_verify_fstab]='校验失败：%s 仍包含 %s 条目。'
     [warn_module_loaded]='tcp_bbr 模块会保持加载，直到下次重启。'
     [ok_restore_done]='恢复完成。'
     [err_restore_failed]='恢复未完成，安装记录已保留，可稍后重试。'
@@ -596,8 +618,8 @@ load_state() {
                     MF_MODULE_CONFIG=1
                 fi
                 ;;
-            LEGACY_BACKUP)
-                MF_LEGACY_BACKUP="$value"
+            BACKUP_DIR|LEGACY_BACKUP)
+                MF_BACKUP_DIR="$value"
                 ;;
             PREV_VALUES_OK)
                 if [ "$value" = "1" ]; then
@@ -647,7 +669,7 @@ write_state() {
         printf 'SWAP_CONFIG_CREATED=%s\n' "$MF_SWAP_CONFIG"
         printf 'BBR_CONFIG_CREATED=%s\n' "$MF_BBR_CONFIG"
         printf 'MODULE_CONFIG_CREATED=%s\n' "$MF_MODULE_CONFIG"
-        printf 'LEGACY_BACKUP=%s\n' "$MF_LEGACY_BACKUP"
+        printf 'BACKUP_DIR=%s\n' "$MF_BACKUP_DIR"
         printf 'PREV_VALUES_OK=%s\n' "$MF_PREV_VALUES_OK"
         printf 'PREV_SWAPPINESS=%s\n' "$MF_PREV_SWAPPINESS"
         printf 'PREV_VFS_CACHE_PRESSURE=%s\n' "$MF_PREV_VFS_CACHE_PRESSURE"
@@ -670,11 +692,77 @@ state_changed() {
        [ "$MF_SWAP_CONFIG" -eq 1 ] ||
        [ "$MF_BBR_CONFIG" -eq 1 ] ||
        [ "$MF_MODULE_CONFIG" -eq 1 ] ||
-       [ -n "$MF_LEGACY_BACKUP" ]; then
+       [ -n "$MF_BACKUP_DIR" ]; then
         return 0
     fi
 
     return 1
+}
+
+ensure_backup_dir() {
+    local dir
+
+    if [ -n "$MF_BACKUP_DIR" ] && [ -d "$MF_BACKUP_DIR" ]; then
+        return 0
+    fi
+
+    dir="${STATE_DIR}/backup.$(date +%Y%m%d-%H%M%S)-$$"
+
+    if ! mkdir -p "$dir"; then
+        log_error err_mkdir_failed "$dir"
+        return 1
+    fi
+
+    MF_BACKUP_DIR="$dir"
+    return 0
+}
+
+move_to_backup() {
+    local file="$1"
+    local base
+
+    if ! ensure_backup_dir; then
+        return 1
+    fi
+
+    base="${file##*/}"
+
+    if ! mv "$file" "${MF_BACKUP_DIR}/${base}"; then
+        log_error err_write_file "$file"
+        return 1
+    fi
+
+    return 0
+}
+
+# A file that already exists at one of the managed paths but carries no marker
+# belongs to the user. It is moved into the backup directory before this
+# script overwrites the path, and a restore puts it back.
+#
+# 托管路径上已存在但没有本脚本标记的文件属于用户。
+# 覆盖前先移入备份目录，恢复时再放回原位。
+backup_file_before_change() {
+    local file="$1"
+
+    if [ ! -e "$file" ]; then
+        return 0
+    fi
+
+    if file_has_marker "$file"; then
+        return 0
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log_info dryrun_backup_file "$file"
+        return 0
+    fi
+
+    if ! move_to_backup "$file"; then
+        return 1
+    fi
+
+    log_ok ok_backup_foreign_file "$file" "$MF_BACKUP_DIR"
+    return 0
 }
 
 clear_state() {
@@ -697,7 +785,13 @@ clear_state() {
 capture_previous_state() {
     local value
 
-    if [ "$DRY_RUN" -eq 1 ] || [ "$MF_PREV_VALUES_OK" -eq 1 ]; then
+    # Only the first install samples the values. A re-run must not record the
+    # values this script already applied as the "previous" ones, and a partial
+    # record must not be filled with guesses either.
+    #
+    # 只有首次安装才采样原始值。重复执行时不能把脚本已经设置的
+    # 值当成"原始值"，残缺的记录也不能用猜测补全。
+    if [ "$DRY_RUN" -eq 1 ] || [ "$MANIFEST_EXISTS" -eq 1 ]; then
         return 0
     fi
 
@@ -963,26 +1057,37 @@ check_operating_system() {
 check_required_commands() {
     local missing_commands=()
     local command_name
-
-    for command_name in \
-        awk \
-        cat \
-        chmod \
-        cp \
-        date \
-        dd \
-        df \
-        free \
-        grep \
-        head \
-        mkdir \
-        mkswap \
-        swapoff \
-        swapon \
-        sysctl \
-        tail \
+    local required_commands=(
+        awk
+        cat
+        chmod
+        cp
+        date
+        dd
+        df
+        free
+        grep
+        head
+        mkdir
+        mktemp
+        mv
+        rm
+        rmdir
+        swapoff
+        swapon
+        sysctl
+        tail
         tr
-    do
+    )
+
+    # Only an install creates a swap file, a restore never needs mkswap.
+    #
+    # 只有安装流程需要创建 Swap 文件，恢复流程不需要 mkswap。
+    if [ "$RESTORE" -eq 0 ]; then
+        required_commands+=(mkswap)
+    fi
+
+    for command_name in "${required_commands[@]}"; do
         if ! have "$command_name"; then
             missing_commands+=("$command_name")
         fi
@@ -1069,6 +1174,10 @@ write_swap_sysctl() {
         return 1
     fi
 
+    if ! backup_file_before_change "$SWAP_CONFIG"; then
+        return 1
+    fi
+
     if ! cat > "$SWAP_CONFIG" <<'EOF'
 # Managed by debian-swap-bbr
 # 由 debian-swap-bbr 管理
@@ -1105,7 +1214,26 @@ get_active_swap() {
 }
 
 swap_is_active() {
-    get_active_swap | grep -Fqx -- "$1"
+    local target="$1"
+    local active
+
+    # The list is read into the loop instead of being piped into "grep -q".
+    # grep exits on the first match, and the writer can then die from SIGPIPE,
+    # which pipefail turns into a false "not active" result.
+    #
+    # 这里没有把列表管道给 grep -q：grep 命中后立即退出，
+    # 上游可能因 SIGPIPE 失败，pipefail 会把"已启用"误判成"未启用"。
+    while IFS= read -r active; do
+        if [ "$active" = "$target" ]; then
+            return 0
+        fi
+    done < <(get_active_swap)
+
+    return 1
+}
+
+file_has_marker() {
+    grep -q -m1 'Managed by debian-swap-bbr' "$1" 2>/dev/null
 }
 
 get_root_fstype() {
@@ -1141,6 +1269,10 @@ check_swapfile_support() {
                 return 1
             fi
             USE_DD=1
+            ;;
+        unknown)
+            log_warn warn_fstype_unknown
+            USE_DD=0
             ;;
         *)
             USE_DD=0
@@ -1291,7 +1423,7 @@ ensure_fstab_entry() {
         return 1
     fi
 
-    backup_file="${FSTAB}.bak.$(date +%Y%m%d-%H%M%S)"
+    backup_file="${FSTAB}.bak.$(date +%Y%m%d-%H%M%S)-$$"
 
     if ! cp -a "$FSTAB" "$backup_file"; then
         log_error err_fstab_backup "$FSTAB"
@@ -1316,6 +1448,11 @@ ensure_fstab_entry() {
 
     log_ok ok_fstab_written "$SWAPFILE" "$FSTAB"
     log_info info_fstab_backup "$backup_file"
+
+    # Make systemd pick up the new entry without waiting for a reboot.
+    #
+    # 让 systemd 立即识别新的 fstab 条目，而不必等到重启。
+    reload_units
 }
 
 configure_swap() {
@@ -1428,15 +1565,13 @@ detect_virtualization() {
 
 migrate_legacy_configs() {
     local legacy_file
-    local base
-    local backup_dir
 
     for legacy_file in "$LEGACY_SWAP_CONFIG" "$LEGACY_BBR_CONFIG"; do
         if [ ! -e "$legacy_file" ]; then
             continue
         fi
 
-        if ! head -n 1 "$legacy_file" 2>/dev/null | grep -q 'Managed by debian-swap-bbr'; then
+        if ! file_has_marker "$legacy_file"; then
             log_warn warn_legacy_foreign "$legacy_file"
             continue
         fi
@@ -1451,20 +1586,7 @@ migrate_legacy_configs() {
         #
         # 旧版文件改为移动进备份目录而不是直接删除，
         # 这样恢复时还能放回去。
-        if [ -z "$MF_LEGACY_BACKUP" ]; then
-            backup_dir="${STATE_DIR}/backup.$(date +%Y%m%d-%H%M%S)"
-
-            if ! mkdir -p "$backup_dir"; then
-                log_error err_mkdir_failed "$backup_dir"
-                continue
-            fi
-
-            MF_LEGACY_BACKUP="$backup_dir"
-        fi
-
-        base="${legacy_file##*/}"
-
-        if mv "$legacy_file" "${MF_LEGACY_BACKUP}/${base}"; then
+        if move_to_backup "$legacy_file"; then
             log_ok ok_deleted_legacy "$legacy_file"
         else
             log_warn warn_delete_legacy_failed "$legacy_file"
@@ -1492,6 +1614,7 @@ remove_fstab_entry() {
     local entry="${SWAPFILE} none swap sw 0 0"
     local backup_file
     local tmp_file
+    local grep_status=0
 
     if ! grep -qxF -- "$entry" "$FSTAB"; then
         log_warn warn_fstab_line_missing "$FSTAB" "$SWAPFILE"
@@ -1503,15 +1626,33 @@ remove_fstab_entry() {
         return 0
     fi
 
-    backup_file="${FSTAB}.bak.$(date +%Y%m%d-%H%M%S)"
+    backup_file="${FSTAB}.bak.$(date +%Y%m%d-%H%M%S)-$$"
 
     if ! cp -a "$FSTAB" "$backup_file"; then
         log_error err_fstab_backup "$FSTAB"
         return 1
     fi
 
-    tmp_file="${FSTAB}.swapbbr.tmp"
-    grep -vxF -- "$entry" "$FSTAB" > "$tmp_file" || true
+    # A unique temporary file avoids two concurrent runs fighting over the
+    # same name. The result is checked before it replaces fstab: grep status
+    # above 1 means the read failed, and an empty result means fstab held
+    # nothing but the swap line. Both cases stop here instead of truncating.
+    #
+    # 使用唯一临时文件名，避免并发运行互相覆盖。
+    # 回写前先检查结果：grep 退出码大于 1 表示读取失败，
+    # 结果为空表示 fstab 里只有 swap 这一行。两种情况都停下，绝不截断。
+    if ! tmp_file=$(mktemp "${FSTAB}.swapbbr.XXXXXX"); then
+        log_error err_tempfile "$FSTAB"
+        return 1
+    fi
+
+    grep -vxF -- "$entry" "$FSTAB" > "$tmp_file" || grep_status=$?
+
+    if [ "$grep_status" -gt 1 ] || [ ! -s "$tmp_file" ]; then
+        rm -f "$tmp_file"
+        log_error err_fstab_empty "$FSTAB"
+        return 1
+    fi
 
     if ! cat "$tmp_file" > "$FSTAB"; then
         rm -f "$tmp_file"
@@ -1520,6 +1661,11 @@ remove_fstab_entry() {
     fi
 
     rm -f "$tmp_file"
+
+    if grep -qxF -- "$entry" "$FSTAB"; then
+        log_error err_write_file "$FSTAB"
+        return 1
+    fi
 
     log_ok ok_fstab_line_removed "$FSTAB" "$SWAPFILE"
     log_info info_fstab_backup "$backup_file"
@@ -1541,7 +1687,7 @@ remove_owned_file() {
         return 0
     fi
 
-    if [ "$recorded" -ne 1 ] && ! head -n 1 "$file" 2>/dev/null | grep -q 'Managed by debian-swap-bbr'; then
+    if [ "$recorded" -ne 1 ] && ! file_has_marker "$file"; then
         log_warn warn_file_not_ours "$file"
         return 0
     fi
@@ -1559,47 +1705,59 @@ remove_owned_file() {
     fi
 }
 
-restore_legacy_backups() {
-    local legacy_file
-    local source_file
-    local base
+# When the backup directory holds a file with the same name, this script
+# displaced a file the user already had, so it is moved back. Otherwise only a
+# file this script created is removed.
+#
+# 如果备份目录里有同名文件，说明这里原本是用户的文件，优先放回；
+# 否则只删除本脚本创建的文件，其他情况一律不动。
+restore_config_file() {
+    local file="$1"
+    local recorded="$2"
+    local base="${file##*/}"
+    local backup_file=""
 
-    if [ -z "$MF_LEGACY_BACKUP" ]; then
-        return 0
+    if [ -n "$MF_BACKUP_DIR" ]; then
+        backup_file="${MF_BACKUP_DIR}/${base}"
     fi
 
-    if [ ! -d "$MF_LEGACY_BACKUP" ]; then
-        log_warn warn_legacy_backup_missing "$MF_LEGACY_BACKUP"
-        return 0
+    if [ -z "$backup_file" ] || [ ! -e "$backup_file" ]; then
+        remove_owned_file "$file" "$recorded"
+        return $?
     fi
 
-    for legacy_file in "$LEGACY_SWAP_CONFIG" "$LEGACY_BBR_CONFIG"; do
-        base="${legacy_file##*/}"
-        source_file="${MF_LEGACY_BACKUP}/${base}"
+    # A file that exists here but carries no marker was created after the
+    # install. Overwriting it with an old backup would destroy newer work, so
+    # the backup is kept and the conflict is reported.
+    #
+    # 这里已存在但没有标记的文件是安装之后新建的。
+    # 用旧备份覆盖它会毁掉更新的内容，因此保留备份并报告冲突。
+    if [ -e "$file" ] && ! file_has_marker "$file"; then
+        log_warn warn_legacy_exists "$file"
+        return 1
+    fi
 
-        if [ ! -e "$source_file" ]; then
-            continue
-        fi
-
-        if [ -e "$legacy_file" ]; then
-            log_warn warn_legacy_exists "$legacy_file"
-            continue
-        fi
-
+    if [ -e "$file" ]; then
         if [ "$DRY_RUN" -eq 1 ]; then
-            log_info dryrun_restore_legacy "$legacy_file"
-            continue
+            log_info dryrun_remove_file "$file"
+        elif ! rm -f "$file"; then
+            log_error err_remove_file "$file"
+            return 1
         fi
+    fi
 
-        if mv "$source_file" "$legacy_file"; then
-            log_ok ok_legacy_restored "$legacy_file"
-        else
-            log_error err_write_file "$legacy_file"
-        fi
-    done
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log_info dryrun_restore_backup "$file"
+        return 0
+    fi
 
-    rmdir "$MF_LEGACY_BACKUP" 2>/dev/null || true
-    return 0
+    if mv "$backup_file" "$file"; then
+        log_ok ok_restore_backup "$file"
+        return 0
+    fi
+
+    log_error err_write_file "$file"
+    return 1
 }
 
 restore_one_sysctl() {
@@ -1617,21 +1775,85 @@ restore_one_sysctl() {
 
     if sysctl -q -w "${key}=${value}"; then
         log_ok info_prev_restored "$key" "$value"
-    else
-        log_warn warn_sysctl_restore_failed "$key"
+        return 0
     fi
+
+    log_error warn_sysctl_restore_failed "$key"
+    return 1
 }
 
 restore_sysctl_values() {
+    local failed=0
+
     if [ "$MF_PREV_VALUES_OK" -ne 1 ]; then
         log_warn warn_prev_unknown
         return 0
     fi
 
-    restore_one_sysctl "vm.swappiness" "$MF_PREV_SWAPPINESS"
-    restore_one_sysctl "vm.vfs_cache_pressure" "$MF_PREV_VFS_CACHE_PRESSURE"
-    restore_one_sysctl "net.core.default_qdisc" "$MF_PREV_QDISC"
-    restore_one_sysctl "net.ipv4.tcp_congestion_control" "$MF_PREV_CC"
+    if ! restore_one_sysctl "vm.swappiness" "$MF_PREV_SWAPPINESS"; then
+        failed=1
+    fi
+
+    if ! restore_one_sysctl "vm.vfs_cache_pressure" "$MF_PREV_VFS_CACHE_PRESSURE"; then
+        failed=1
+    fi
+
+    if ! restore_one_sysctl "net.core.default_qdisc" "$MF_PREV_QDISC"; then
+        failed=1
+    fi
+
+    if ! restore_one_sysctl "net.ipv4.tcp_congestion_control" "$MF_PREV_CC"; then
+        failed=1
+    fi
+
+    return "$failed"
+}
+
+# The restore is verified the same way an install is: reading the real state
+# instead of trusting the commands that ran before.
+#
+# 恢复后同样要校验真实状态，而不是相信前面命令的返回值。
+verify_restore() {
+    local failed=0
+    local value
+
+    if swap_is_active "$SWAPFILE"; then
+        log_error err_verify_swap_active "$SWAPFILE"
+        failed=1
+    fi
+
+    if [ "$MF_FSTAB_ADDED" -eq 1 ] && fstab_has_swapfile; then
+        log_error err_verify_fstab "$FSTAB" "$SWAPFILE"
+        failed=1
+    fi
+
+    if [ "$MF_PREV_VALUES_OK" -eq 1 ]; then
+        value=$(sysctl -n vm.swappiness 2>/dev/null) || value=""
+        if [ "$value" != "$MF_PREV_SWAPPINESS" ]; then
+            log_error err_verify_value "vm.swappiness" "$MF_PREV_SWAPPINESS" "${value:-unknown}"
+            failed=1
+        fi
+
+        value=$(sysctl -n vm.vfs_cache_pressure 2>/dev/null) || value=""
+        if [ "$value" != "$MF_PREV_VFS_CACHE_PRESSURE" ]; then
+            log_error err_verify_value "vm.vfs_cache_pressure" "$MF_PREV_VFS_CACHE_PRESSURE" "${value:-unknown}"
+            failed=1
+        fi
+
+        value=$(sysctl -n net.core.default_qdisc 2>/dev/null) || value=""
+        if [ "$value" != "$MF_PREV_QDISC" ]; then
+            log_error err_verify_value "net.core.default_qdisc" "$MF_PREV_QDISC" "${value:-unknown}"
+            failed=1
+        fi
+
+        value=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || value=""
+        if [ "$value" != "$MF_PREV_CC" ]; then
+            log_error err_verify_value "net.ipv4.tcp_congestion_control" "$MF_PREV_CC" "${value:-unknown}"
+            failed=1
+        fi
+    fi
+
+    [ "$failed" -eq 0 ]
 }
 
 restore_all() {
@@ -1664,10 +1886,11 @@ restore_all() {
     #
     # 只有安装记录证明文件由本脚本创建时才删除，已有文件一律保留。
     if [ "$MF_SWAPFILE_CREATED" -eq 1 ] && [ -e "$SWAPFILE" ]; then
-        if swap_is_active "$SWAPFILE"; then
-            log_warn warn_swap_active_kept "$SWAPFILE"
-        elif [ "$DRY_RUN" -eq 1 ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
             log_info dryrun_remove_file "$SWAPFILE"
+        elif swap_is_active "$SWAPFILE"; then
+            log_warn warn_swap_active_kept "$SWAPFILE"
+            failed=1
         elif rm -f "$SWAPFILE"; then
             log_ok ok_swapfile_removed "$SWAPFILE"
         else
@@ -1684,23 +1907,49 @@ restore_all() {
         log_info info_fstab_kept "$FSTAB"
     fi
 
-    if ! remove_owned_file "$SWAP_CONFIG" "$MF_SWAP_CONFIG"; then
+    if [ -n "$MF_BACKUP_DIR" ] && [ ! -d "$MF_BACKUP_DIR" ]; then
+        log_warn warn_legacy_backup_missing "$MF_BACKUP_DIR"
+    fi
+
+    if ! restore_config_file "$SWAP_CONFIG" "$MF_SWAP_CONFIG"; then
         failed=1
     fi
 
-    if ! remove_owned_file "$BBR_CONFIG" "$MF_BBR_CONFIG"; then
+    if ! restore_config_file "$BBR_CONFIG" "$MF_BBR_CONFIG"; then
         failed=1
     fi
 
-    if ! remove_owned_file "$BBR_MODULE_CONFIG" "$MF_MODULE_CONFIG"; then
+    if ! restore_config_file "$BBR_MODULE_CONFIG" "$MF_MODULE_CONFIG"; then
         failed=1
     fi
 
-    restore_legacy_backups
-    restore_sysctl_values
+    if ! restore_config_file "$LEGACY_SWAP_CONFIG" 0; then
+        failed=1
+    fi
+
+    if ! restore_config_file "$LEGACY_BBR_CONFIG" 0; then
+        failed=1
+    fi
+
+    if [ -n "$MF_BACKUP_DIR" ] && [ -d "$MF_BACKUP_DIR" ]; then
+        if [ -n "$(ls -A "$MF_BACKUP_DIR" 2>/dev/null)" ]; then
+            log_warn warn_backup_remaining "$MF_BACKUP_DIR"
+            failed=1
+        elif [ "$DRY_RUN" -eq 0 ]; then
+            rmdir "$MF_BACKUP_DIR" 2>/dev/null || true
+        fi
+    fi
+
+    if ! restore_sysctl_values; then
+        failed=1
+    fi
 
     if have lsmod && lsmod | awk '$1 == "tcp_bbr" {found = 1} END {exit !found}'; then
         log_warn warn_module_loaded
+    fi
+
+    if [ "$DRY_RUN" -eq 0 ] && ! verify_restore; then
+        failed=1
     fi
 
     if [ "$failed" -ne 0 ]; then
@@ -1775,6 +2024,10 @@ configure_bbr() {
             return 1
         fi
 
+        if ! backup_file_before_change "$BBR_MODULE_CONFIG"; then
+            return 1
+        fi
+
         if ! {
             printf '%s\n' '# Managed by debian-swap-bbr'
             printf '%s\n' '# 由 debian-swap-bbr 管理'
@@ -1796,6 +2049,10 @@ configure_bbr() {
     fi
 
     if ! ensure_config_dir "$SYSCTL_DIR"; then
+        return 1
+    fi
+
+    if ! backup_file_before_change "$BBR_CONFIG"; then
         return 1
     fi
 
@@ -1827,28 +2084,64 @@ EOF
 }
 
 check_sysctl_conflicts() {
+    local file
     local line
     local key
+    local value
+    local expected
     local found=0
 
-    if [ ! -r /etc/sysctl.conf ]; then
-        return 0
-    fi
+    # Both /etc/sysctl.conf and the snippets in /etc/sysctl.d are scanned,
+    # the two files written by this script are skipped. A snippet that sets
+    # the same key to a different value is reported.
+    #
+    # 同时扫描 /etc/sysctl.conf 与 /etc/sysctl.d 里的片段，跳过本脚本的
+    # 两个配置文件；同名的键如果取值不同就提示。
+    for file in /etc/sysctl.conf "$SYSCTL_DIR"/*.conf; do
+        if [ ! -r "$file" ]; then
+            continue
+        fi
 
-    while IFS= read -r line; do
-        key="${line%%=*}"
-        key="${key//[[:space:]]/}"
+        if [ "${file##*/}" = "${SWAP_CONFIG##*/}" ] || [ "${file##*/}" = "${BBR_CONFIG##*/}" ]; then
+            continue
+        fi
 
-        case "$key" in
-            ''|'#'*)
+        while IFS= read -r line; do
+            key="${line%%=*}"
+            key="${key//[[:space:]]/}"
+
+            case "$key" in
+                ''|'#'*)
+                    continue
+                    ;;
+                vm.swappiness)
+                    expected="10"
+                    ;;
+                vm.vfs_cache_pressure)
+                    expected="50"
+                    ;;
+                net.ipv4.tcp_congestion_control)
+                    expected="bbr"
+                    ;;
+                net.core.default_qdisc)
+                    expected="fq"
+                    ;;
+                *)
+                    continue
+                    ;;
+            esac
+
+            value="${line#*=}"
+            value="${value//[[:space:]]/}"
+
+            if [ "$value" = "$expected" ]; then
                 continue
-                ;;
-            vm.swappiness|vm.vfs_cache_pressure|net.ipv4.tcp_congestion_control|net.core.default_qdisc)
-                log_warn warn_sysctl_conflict "/etc/sysctl.conf" "$key"
-                found=1
-                ;;
-        esac
-    done < /etc/sysctl.conf
+            fi
+
+            log_warn warn_sysctl_conflict "$file" "$key"
+            found=1
+        done < "$file"
+    done
 
     if [ "$found" -eq 1 ]; then
         log_warn warn_sysctl_order
@@ -1968,13 +2261,17 @@ show_result() {
         printf '%s\n' "$(msg result_swapfile_none)"
     fi
 
-    if [ "$SWAP_CONFIGURED" -eq 1 ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '%s\n' "$(msg result_swap_plan)"
+    elif [ "$SWAP_CONFIGURED" -eq 1 ]; then
         printf '%s\n' "$(msg result_swap_ok)"
     else
         printf '%s\n' "$(msg result_swap_fail)"
     fi
 
-    if [ "$BBR_CONFIGURED" -eq 1 ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '%s\n' "$(msg result_bbr_plan)"
+    elif [ "$BBR_CONFIGURED" -eq 1 ]; then
         printf '%s\n' "$(msg result_bbr_ok)"
     else
         printf '%s\n' "$(msg result_bbr_fail)"

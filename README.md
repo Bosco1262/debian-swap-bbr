@@ -26,6 +26,7 @@ The script inspects the current state and applies the configuration idempotently
 - Detect container environments such as LXC and OpenVZ
 - Verify the values that actually took effect instead of trusting exit codes
 - Support `--dry-run` for a read-only check
+- Support `--restore` to undo only the changes this script made
 - Support `--lang` for the output language
 - Stay idempotent
 
@@ -134,7 +135,8 @@ curl URL | bash
 -l, --lang LANG  Output language: en or zh-CN
                  Defaults to the system locale, English as the fallback
 -n, --dry-run    Check the environment and print the plan, change nothing
---restore        Remove what this script created and return to the previous state
+--restore, --uninstall
+                 Remove what this script created and return to the previous state
                  Combine with --dry-run to only print the plan
 -h, --help       Show the help text
 -V, --version    Show the script version
@@ -257,7 +259,7 @@ The script manages these files:
 /var/lib/debian-swap-bbr/state
 ```
 
-`/var/lib/debian-swap-bbr/state` is the install record, `--restore` uses it to decide whether a change was made by this script.
+`/var/lib/debian-swap-bbr/state` is the install record, `--restore` uses it to decide whether a change was made by this script. `/var/lib/debian-swap-bbr/backup.*` only appears when something had to be backed up: a migrated legacy config, or a user file that already existed at a managed path.
 
 The file names deliberately sort after `99-sysctl.conf`, which on Debian is a symlink to `/etc/sysctl.conf`, so the values are not overridden at boot. The script also reports conflicting keys found in `/etc/sysctl.conf`.
 
@@ -313,6 +315,8 @@ Behaviour details:
 
 - `--restore --dry-run` prints the plan and changes nothing
 - A failing `swapoff` (out of memory) aborts the restore and keeps both `/swapfile` and the install record, so it can be retried later
+- Before finishing, the restore re-checks the real state: swap is gone, fstab is clean and the four kernel parameters are back. Any mismatch keeps the install record and returns a non-zero status
+- A file the user already had at a managed path is moved into `/var/lib/debian-swap-bbr/backup.*` during installation and moved back by the restore; if a newer file appeared at that path, the backup is kept and reported
 - The restore is idempotent, a second run returns 0
 - `--restore` and `--swap-size` are mutually exclusive, using both returns exit code 2
 - Without an install record (for example an installation made by 1.0–1.2) only the marker files are removed, `/swapfile` and fstab are left untouched with a warning
@@ -432,7 +436,7 @@ bash -n setup-swap-bbr.sh
 Comments are bilingual, English first and Simplified Chinese second, and follow these spacing rules:
 
 ```bash
-# 单个英文注释行与对应的中文注释行之间不留空行。
+# No blank line is needed between two single-line comments.
 # 单行注释的两种注释间不需要空行。
 
 # A blank line must be left between
