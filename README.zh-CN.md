@@ -28,6 +28,7 @@
 - 支持 `--dry-run` 预检
 - 支持 `--restore` 精确撤销本脚本创建的配置
 - 支持 `--lang` 切换输出语言
+- 使用锁串行化并发运行，两个实例不会交错执行
 - 支持重复运行
 
 ## 不会执行的操作
@@ -65,6 +66,7 @@
 | ZFS                    | 不支持 Swap 文件，脚本会直接报错退出                 |
 | overlayfs / aufs       | 不支持（常见于 Docker），脚本会直接报错退出          |
 | NFS / CIFS / 9p / FUSE | 不支持，脚本会直接报错退出                          |
+| virtiofs / Ceph / GlusterFS | 不支持，脚本会直接报错退出                      |
 
 btrfs 场景需要系统存在 `chattr` 命令，否则脚本会拒绝创建 Swap 文件。
 
@@ -133,7 +135,7 @@ curl URL | bash
 ```text
 --swap-size N    指定 Swap 大小，单位为 GiB，范围 1 到 32
                  也支持 --swap-size=N
--l, --lang LANG  输出语言：en 或 zh-CN
+-l, --lang LANG  输出语言：en 或 zh-CN，也可写作 --language
                  默认跟随系统 locale，无法识别时回退英文
 -n, --dry-run    只检查环境并输出计划，不修改任何文件
 --restore, --uninstall
@@ -162,7 +164,7 @@ sudo ./setup-swap-bbr.sh --swap-size=4
 脚本输出的语言遵循固定优先级：
 
 1. 显式参数 `-l`、`--lang` 或 `--language`，取值为 `en` 或 `zh-CN`。
-2. 自动检测系统 locale（`LC_ALL`、`LC_MESSAGES`、`LANG`）。
+2. 先看 `LANGUAGE`，再自动检测系统 locale（`LC_ALL`、`LC_MESSAGES`、`LANG`）。
 3. 无法识别时回退英文。
 
 ```bash
@@ -258,23 +260,28 @@ lsmod | grep tcp_bbr
 /etc/sysctl.d/99-zz-local-bbr.conf
 /etc/modules-load.d/bbr.conf
 /var/lib/debian-swap-bbr/state
+/run/debian-swap-bbr.lock
 ```
 
-其中 `/var/lib/debian-swap-bbr/state` 是安装状态清单，`--restore` 依赖它判断每一项改动是否由脚本完成。`/var/lib/debian-swap-bbr/backup.*` 只在需要备份时出现：旧版本配置迁移、或目标路径上原本就有用户自己的同名文件。
+其中 `/var/lib/debian-swap-bbr/state` 是安装状态清单，`--restore` 依赖它判断每一项改动是否由脚本完成。它先写入同目录的临时文件再改名，中断时不会留下被截断的清单。`/var/lib/debian-swap-bbr/backup.*` 只在需要备份时出现：旧版本配置迁移、或目标路径上原本就有用户自己的同名文件。
 
-文件名刻意排在 `99-sysctl.conf`（在 Debian 上是指向 `/etc/sysctl.conf` 的软链）之后，避免开机时被 `/etc/sysctl.conf` 中的同名键覆盖。脚本启动时也会提示 `/etc/sysctl.conf` 中是否存在冲突的同名键。
+`/run/debian-swap-bbr.lock` 只在运行期间存在。同一时刻启动的第二个实例会直接以退出码 1 结束，不会与前一个实例交错执行。`--dry-run` 不取锁，也不创建任何文件。
+
+文件名刻意排在 `99-sysctl.conf`（在 Debian 上是指向 `/etc/sysctl.conf` 的软链）之后，避免开机时被 `/etc/sysctl.conf` 中的同名键覆盖。脚本还会扫描 `/etc/sysctl.conf` 与 `/etc/sysctl.d`，把同名但取值不同的键提示出来；扫描时会跳过脚本自己写的两个文件，以及 `99-sysctl.conf` 这个软链。
 
 如果内核已内置 `tcp_bbr`，脚本会跳过 `/etc/modules-load.d/bbr.conf`，避免开机时出现模块找不到的报错。
 
-如果脚本需要修改 `/etc/fstab`，会先创建带时间戳的备份：
+如果脚本需要修改 `/etc/fstab`，会先创建带时间戳的备份。进程号用于区分同一秒内的两次运行：
 
 ```text
-/etc/fstab.bak.YYYYMMDD-HHMMSS
+/etc/fstab.bak.YYYYMMDD-HHMMSS-PID
 ```
+
+这些备份不会被自动清理。确认系统运行正常后，请自行删除旧备份。
 
 ### 从旧版本升级
 
-旧版本使用 `90-local-*.conf`。脚本只会删除首行包含 `Managed by debian-swap-bbr` 标记的旧文件，其他文件一律保留并给出提示。
+旧版本使用 `90-local-*.conf`。脚本只会处理首行恰好是 `# Managed by debian-swap-bbr` 的旧文件，其他文件一律保留并给出提示。所有托管配置文件的归属判定都遵循这条"首行精确匹配"规则，因此仅在后面某行提到该标记的用户文件仍然不受影响。
 
 ## 幂等性与失败处理
 
@@ -284,6 +291,9 @@ lsmod | grep tcp_bbr
 - fstab 已有 `/swapfile` 条目（无论挂载点写 `none` 还是 `swap`）：不会重复追加
 - 创建过程中失败：脚本会删除本次创建但未能启用的 `/swapfile`，避免留下无效文件
 - 关键命令失败：立即返回非 0 退出码，而不是继续打印"配置完成"
+- 已修改系统后发生未预期错误：退出前先写入安装记录，`--restore` 仍然可以撤销
+- 同一时刻运行两个实例：第二个实例以退出码 1 结束，不会与前一个交错
+- 已有但未启用的 `/swapfile`：原样复用，并明确提示 `--swap-size` 被忽略，而不是静默丢弃
 
 ## 恢复（--restore）
 
@@ -297,12 +307,13 @@ sudo ./setup-swap-bbr.sh --restore             # 正式恢复
 恢复按依赖顺序执行：
 
 1. `swapoff /swapfile`（只有清单记录"由脚本启用"时才执行）
-2. 删除 `/swapfile`（只有清单记录"由脚本创建"时才执行，已有文件一律保留）
-3. 从 `/etc/fstab` 删除由脚本写入的那一行（精确匹配，删除前备份）
-4. `systemctl daemon-reload`
-5. 删除带脚本标记的 `99-zz-local-*.conf` 与 `modules-load.d/bbr.conf`
-6. 把旧版本 `90-local-*.conf` 从备份目录放回原位
-7. 用清单记录的旧值恢复 4 个内核参数
+2. 从 `/etc/fstab` 删除由脚本写入的那一行（精确匹配，删除前备份），随后 `systemctl daemon-reload`
+3. 删除 `/swapfile`（只有清单记录"由脚本创建"时才执行，已有文件一律保留）
+4. 删除带脚本标记的 `99-zz-local-*.conf` 与 `modules-load.d/bbr.conf`
+5. 把旧版本 `90-local-*.conf` 从备份目录放回原位
+6. 用清单记录的旧值恢复 4 个内核参数
+
+第 2 步刻意排在第 3 步之前：如果恢复在中途被打断，下次开机看到的是干净的 `/etc/fstab`，而不是一个指向已被删除文件的挂载项。
 
 恢复**不会**做这些事：
 
@@ -316,7 +327,7 @@ sudo ./setup-swap-bbr.sh --restore             # 正式恢复
 
 - `--restore --dry-run` 只打印计划，不产生任何改动
 - `swapoff` 失败（内存不足）时立即中止，`/swapfile` 与状态清单都保留，可稍后重试
-- 恢复结束前会复查真实状态（Swap 是否已关闭、fstab 是否干净、4 个内核参数是否回到旧值），任一项不符都会保留状态清单并返回非 0
+- 恢复结束前会复查真实状态（本脚本启用过的 Swap 是否已关闭、fstab 是否干净、4 个内核参数是否回到旧值），任一项不符都会保留状态清单并返回非 0。安装前就已启用的 `/swapfile` 是故意保留的，不计为失败
 - 安装时如果目标路径上已有用户自己的同名配置文件，会先移入 `/var/lib/debian-swap-bbr/backup.*`，恢复时放回；若放回时该路径已有更新的文件，则保留备份并提示手动处理
 - 恢复是幂等的，重复执行返回 0
 - `--restore` 与 `--swap-size` 互斥，同时使用返回退出码 2
@@ -332,6 +343,7 @@ sudo ./setup-swap-bbr.sh --restore             # 正式恢复
 | `当前内核没有提供 BBR`/`This kernel does not provide BBR` | 内核不支持 BBR，或容器未向容器提供 BBR，脚本不会安装第三方内核                        |
 | `校验失败：net.ipv4.tcp_congestion_control`         | `/etc/sysctl.conf` 中存在冲突配置，或运行在受限容器中                                 |
 | `/swapfile 已存在，但不能确认它是 Swap 文件`        | 出于安全考虑脚本不会覆盖，请自行确认该文件用途                                        |
+| `已有另一个实例正在运行`/`Another instance is already running` | 另一个实例持有 `/run/debian-swap-bbr.lock`，等它结束后再试                  |
 | `env: 'bash\r': No such file or directory`          | 脚本被 Windows 的 CRLF 换行污染，执行 `sed -i 's/\r$//' setup-swap-bbr.sh` 后重试     |
 
 查看脚本执行失败的行号和退出码，可直接从输出中的 `脚本在第 N 行执行失败` 定位。
@@ -431,6 +443,17 @@ shellcheck setup-swap-bbr.sh
 ```bash
 bash -n setup-swap-bbr.sh
 ```
+
+### 本地测试
+
+两个脚本覆盖了所有不需要 Debian 主机就能验证的内容：
+
+```bash
+bash tests/check-messages.sh   # MSG_EN 与 MSG_ZH 的键必须完全一致
+bash tests/cli.sh              # 参数解析、语言预扫描、退出码
+```
+
+两者都在 root 检查之前结束，因此不需要 `sudo`，也不要求 Debian 主机；CI 会在每次 push 时运行它们。真正创建 Swap 文件的用例仍需要在测试机或快照上验证。
 
 ### 代码注释规范
 

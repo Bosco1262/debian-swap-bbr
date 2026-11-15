@@ -42,13 +42,14 @@ set -Eeuo pipefail
 umask 022
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.3.1"
+readonly SCRIPT_VERSION="1.4.0"
 readonly SWAPFILE="/swapfile"
 readonly FSTAB="/etc/fstab"
 readonly SYSCTL_DIR="/etc/sysctl.d"
 readonly MODULES_LOAD_DIR="/etc/modules-load.d"
 readonly STATE_DIR="/var/lib/debian-swap-bbr"
 readonly STATE_FILE="${STATE_DIR}/state"
+readonly LOCK_FILE="/run/debian-swap-bbr.lock"
 
 # The file names must sort after 99-sysctl.conf, which is a symlink to
 # /etc/sysctl.conf on Debian, otherwise the same keys are overridden at boot.
@@ -62,7 +63,18 @@ readonly BBR_MODULE_CONFIG="${MODULES_LOAD_DIR}/bbr.conf"
 readonly LEGACY_SWAP_CONFIG="${SYSCTL_DIR}/90-local-swap.conf"
 readonly LEGACY_BBR_CONFIG="${SYSCTL_DIR}/90-local-bbr.conf"
 
+# The expected values live in one place: the sysctl files, the conflict scan and
+# the verification all read them from here, so the three can never drift apart.
+#
+# 期望值只在这里定义一次：写配置文件、冲突扫描、结果校验都从这里取值，
+# 三处不会各自漂移。
+readonly EXPECTED_SWAPPINESS="10"
+readonly EXPECTED_VFS_CACHE_PRESSURE="50"
+readonly EXPECTED_CC="bbr"
+readonly EXPECTED_QDISC="fq"
+
 SWAP_SIZE_GB=0
+SWAP_SIZE_USER=0
 SWAP_CREATED=0
 SWAP_CONFIGURED=0
 BBR_CONFIGURED=0
@@ -72,8 +84,9 @@ SWAPFILE_OWNED=0
 SWAP_ACTIVATED=0
 USE_DD=0
 CLEANING_UP=0
+HANDLING_ERROR=0
 ROOT_FSTYPE=""
-LANGUAGE=""
+OUTPUT_LANG=""
 
 # The install record answers "did this script create it" during a restore.
 #
@@ -93,18 +106,27 @@ MF_PREV_VFS_CACHE_PRESSURE=""
 MF_PREV_CC=""
 MF_PREV_QDISC=""
 
+# Colours are decided per stream: stdout may be redirected to a file while
+# stderr still goes to a terminal, and the other way round.
+#
+# 颜色按输出流分别判断：标准输出可能被重定向到文件而标准错误仍在终端，反之亦然。
+OUT_GREEN=''
+OUT_CYAN=''
+OUT_NC=''
+ERR_RED=''
+ERR_YELLOW=''
+ERR_NC=''
+
 if [ -t 1 ]; then
-    readonly RED='\033[0;31m'
-    readonly GREEN='\033[0;32m'
-    readonly YELLOW='\033[0;33m'
-    readonly CYAN='\033[0;36m'
-    readonly NC='\033[0m'
-else
-    readonly RED=''
-    readonly GREEN=''
-    readonly YELLOW=''
-    readonly CYAN=''
-    readonly NC=''
+    OUT_GREEN=$'\033[0;32m'
+    OUT_CYAN=$'\033[0;36m'
+    OUT_NC=$'\033[0m'
+fi
+
+if [ -t 2 ]; then
+    ERR_RED=$'\033[0;31m'
+    ERR_YELLOW=$'\033[0;33m'
+    ERR_NC=$'\033[0m'
 fi
 
 # Every user-facing string lives in these two tables.
@@ -115,7 +137,7 @@ declare -A MSG_EN=(
 
 Options:
   --swap-size N     Swap size in GiB, 1 to 32 (also --swap-size=N)
-  -l, --lang LANG   Output language: en or zh-CN
+  -l, --lang LANG   Output language: en or zh-CN, --language is an alias
                     Defaults to the system locale, English as fallback
   -n, --dry-run     Check the environment and print the plan, change nothing
   --restore, --uninstall
@@ -139,7 +161,7 @@ Note:
     [ok_os_detected]='Detected system: %s'
     [err_missing_commands]='Missing required commands: %s'
     [err_install_hint]='Try installing them with:'
-    [err_install_cmd]='apt-get update && apt-get install -y util-linux procps kmod coreutils'
+    [err_install_cmd]='apt-get update && apt-get install -y util-linux procps coreutils'
     [warn_blkid_missing]='blkid is missing, an existing /swapfile cannot be verified safely.'
     [info_no_fallocate]='fallocate is not available, dd will be used to create the swap file.'
     [ok_commands]='Required commands are available.'
@@ -189,9 +211,11 @@ Note:
     [info_fstab_backup]='fstab backup: %s'
     [info_swap_active]='Swap is already enabled: %s'
     [info_swap_preserved]='Keeping the existing swap, no new %s will be created.'
+    [warn_zram_swappiness]='zram swap detected, vm.swappiness=10 may be too low for a compressed RAM swap.'
     [info_swap_not_ours]='The existing swap is not %s, %s will not be modified.'
     [ok_swap_checked]='Swap configuration checked.'
     [warn_swapfile_idle]='%s exists but is not enabled.'
+    [warn_swap_size_ignored]='%s is reused as it is, the requested --swap-size is ignored.'
     [info_swapfile_signature]='%s has a valid swap signature and will be enabled.'
     [err_swapfile_unknown]='%s exists but cannot be confirmed as a swap file.'
     [err_swapfile_keep]='To avoid overwriting data, the script will not modify or delete it.'
@@ -302,6 +326,9 @@ Note:
     [err_restore_failed]='Restore did not complete, the install record is kept for a retry.'
     [info_state_written]='Install record written to %s.'
     [err_state_write]='Cannot write %s.'
+    [warn_no_flock]='flock is missing, concurrent runs cannot be serialized.'
+    [err_lock_file]='Cannot create the lock file %s.'
+    [err_already_running]='Another instance is already running, nothing was changed.'
 )
 
 # The Chinese table must provide the same keys as MSG_EN.
@@ -312,7 +339,7 @@ declare -A MSG_ZH=(
 
 选项：
   --swap-size N     Swap 大小，单位 GiB，范围 1 到 32（也支持 --swap-size=N）
-  -l, --lang LANG   输出语言：en 或 zh-CN
+  -l, --lang LANG   输出语言：en 或 zh-CN，也可写作 --language
                     默认跟随系统 locale，无法识别时回退英文
   -n, --dry-run     只检查环境并输出计划，不修改任何内容
   --restore, --uninstall
@@ -336,7 +363,7 @@ declare -A MSG_ZH=(
     [ok_os_detected]='检测到系统：%s'
     [err_missing_commands]='缺少必要命令：%s'
     [err_install_hint]='可尝试执行以下命令安装依赖：'
-    [err_install_cmd]='apt-get update && apt-get install -y util-linux procps kmod coreutils'
+    [err_install_cmd]='apt-get update && apt-get install -y util-linux procps coreutils'
     [warn_blkid_missing]='缺少 blkid，已存在的 /swapfile 将无法被安全校验。'
     [info_no_fallocate]='系统没有 fallocate，创建 Swap 文件时会使用 dd。'
     [ok_commands]='必要命令检查通过。'
@@ -386,9 +413,11 @@ declare -A MSG_ZH=(
     [info_fstab_backup]='fstab 备份位置：%s'
     [info_swap_active]='系统已经启用 Swap：%s'
     [info_swap_preserved]='脚本将保留现有 Swap，不创建新的 %s。'
+    [warn_zram_swappiness]='检测到 zram Swap，vm.swappiness=10 对压缩内存交换可能偏低。'
     [info_swap_not_ours]='现有 Swap 不是 %s，脚本不会修改 %s。'
     [ok_swap_checked]='Swap 配置检查完成。'
     [warn_swapfile_idle]='%s 已存在，但当前没有启用。'
+    [warn_swap_size_ignored]='%s 将被原样复用，指定的 --swap-size 会被忽略。'
     [info_swapfile_signature]='%s 具有有效的 Swap 签名，将直接启用。'
     [err_swapfile_unknown]='%s 已存在，但不能确认它是 Swap 文件。'
     [err_swapfile_keep]='为避免覆盖重要数据，脚本不会修改或删除该文件。'
@@ -499,6 +528,9 @@ declare -A MSG_ZH=(
     [err_restore_failed]='恢复未完成，安装记录已保留，可稍后重试。'
     [info_state_written]='安装记录已写入 %s。'
     [err_state_write]='无法写入 %s。'
+    [warn_no_flock]='缺少 flock，无法阻止多个实例同时运行。'
+    [err_lock_file]='无法创建锁文件 %s。'
+    [err_already_running]='已有另一个实例正在运行，未做任何修改。'
 )
 
 # Translate a message key, extra arguments fill the printf placeholders.
@@ -509,7 +541,7 @@ msg() {
 
     local format=""
 
-    if [ "$LANGUAGE" = "zh-CN" ]; then
+    if [ "$OUTPUT_LANG" = "zh-CN" ]; then
         format="${MSG_ZH[$key]:-}"
     fi
 
@@ -535,28 +567,28 @@ log_ok() {
     local key="$1"
     shift
 
-    printf '%b[OK]%b %s\n' "$GREEN" "$NC" "$(msg "$key" "$@")"
+    printf '%b[OK]%b %s\n' "$OUT_GREEN" "$OUT_NC" "$(msg "$key" "$@")"
 }
 
 log_info() {
     local key="$1"
     shift
 
-    printf '%b[INFO]%b %s\n' "$CYAN" "$NC" "$(msg "$key" "$@")"
+    printf '%b[INFO]%b %s\n' "$OUT_CYAN" "$OUT_NC" "$(msg "$key" "$@")"
 }
 
 log_warn() {
     local key="$1"
     shift
 
-    printf '%b[WARN]%b %s\n' "$YELLOW" "$NC" "$(msg "$key" "$@")" >&2
+    printf '%b[WARN]%b %s\n' "$ERR_YELLOW" "$ERR_NC" "$(msg "$key" "$@")" >&2
 }
 
 log_error() {
     local key="$1"
     shift
 
-    printf '%b[ERROR]%b %s\n' "$RED" "$NC" "$(msg "$key" "$@")" >&2
+    printf '%b[ERROR]%b %s\n' "$ERR_RED" "$ERR_NC" "$(msg "$key" "$@")" >&2
 }
 
 have() {
@@ -644,6 +676,7 @@ load_state() {
 
 write_state() {
     local installed_at
+    local tmp_file
 
     if [ "$DRY_RUN" -eq 1 ]; then
         return 0
@@ -657,6 +690,16 @@ write_state() {
 
     if ! mkdir -p "$STATE_DIR"; then
         log_error err_mkdir_failed "$STATE_DIR"
+        return 1
+    fi
+
+    # Write next to the final path and rename afterwards, so an interrupted
+    # write can never leave a truncated install record behind.
+    #
+    # 先写到同目录的临时文件，成功后再改名，
+    # 这样中断时不会留下被截断的安装记录。
+    if ! tmp_file=$(mktemp "${STATE_DIR}/state.XXXXXX"); then
+        log_error err_tempfile "$STATE_DIR"
         return 1
     fi
 
@@ -675,13 +718,25 @@ write_state() {
         printf 'PREV_VFS_CACHE_PRESSURE=%s\n' "$MF_PREV_VFS_CACHE_PRESSURE"
         printf 'PREV_CC=%s\n' "$MF_PREV_CC"
         printf 'PREV_QDISC=%s\n' "$MF_PREV_QDISC"
-    } > "$STATE_FILE"
+    } > "$tmp_file"
     then
+        rm -f "$tmp_file"
         log_error err_state_write "$STATE_FILE"
         return 1
     fi
 
-    chmod 644 "$STATE_FILE" 2>/dev/null || true
+    if ! chmod 644 "$tmp_file"; then
+        rm -f "$tmp_file"
+        log_error err_chmod_file "$STATE_FILE"
+        return 1
+    fi
+
+    if ! mv -f "$tmp_file" "$STATE_FILE"; then
+        rm -f "$tmp_file"
+        log_error err_state_write "$STATE_FILE"
+        return 1
+    fi
+
     return 0
 }
 
@@ -817,22 +872,22 @@ capture_previous_state() {
 
 # Language resolution follows a fixed priority:
 #   1. an explicit -l / --lang / --language value,
-#   2. LC_ALL, LC_MESSAGES or LANG,
+#   2. LANGUAGE, LC_ALL, LC_MESSAGES or LANG,
 #   3. English.
 #
 # 语言解析遵循固定优先级：
 #   1. 显式的 -l / --lang / --language 参数，
-#   2. LC_ALL、LC_MESSAGES 或 LANG，
+#   2. LANGUAGE、LC_ALL、LC_MESSAGES 或 LANG，
 #   3. 英文兜底。
 set_language() {
     local value="$1"
 
     case "$value" in
         en)
-            LANGUAGE="en"
+            OUTPUT_LANG="en"
             ;;
         zh-CN|zh|zh_CN|zh_cn|zh-Hans|zh-hans)
-            LANGUAGE="zh-CN"
+            OUTPUT_LANG="zh-CN"
             ;;
         *)
             # The language is unknown at this point, so answer in both.
@@ -846,8 +901,16 @@ set_language() {
 
 detect_language() {
     local candidate
+    local from_language
 
-    candidate="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+    # gettext gives LANGUAGE priority over the LC_* variables, so a user who
+    # only exports LANGUAGE=zh_CN still gets Chinese output.
+    #
+    # gettext 中 LANGUAGE 的优先级高于 LC_* 变量，
+    # 只设置 LANGUAGE=zh_CN 的用户同样应该看到中文。
+    from_language="${LANGUAGE:-}"
+    from_language="${from_language%%:*}"
+    candidate="${from_language:-${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}}"
     candidate="${candidate%%@*}"
     candidate="${candidate%%.*}"
 
@@ -916,10 +979,31 @@ cleanup_partial() {
 
 handle_error() {
     local exit_code=$?
+
+    # A failing log call must not re-enter this handler.
+    # 日志本身失败时不能再次进入本函数，避免递归。
+    if [ "$HANDLING_ERROR" -eq 1 ]; then
+        exit "$exit_code"
+    fi
+
+    HANDLING_ERROR=1
+
     local line_number=${1:-unknown}
 
     log_error err_line "$line_number" "$exit_code"
     log_error err_check_output
+
+    # An unexpected failure can strike after the system was already changed.
+    # Record what was done first: without an install record a later --restore
+    # leaves /swapfile and the fstab entry behind and cannot restore the four
+    # kernel parameters to their previous values.
+    #
+    # 未预期的失败可能发生在系统已经被修改之后。先记账，
+    # 否则之后的 --restore 会留下 /swapfile 与 fstab 条目，
+    # 也无法把 4 个内核参数还原成改动前的值。
+    if [ "$DRY_RUN" -eq 0 ] && [ "$RESTORE" -eq 0 ] && state_changed; then
+        write_state || true
+    fi
 
     cleanup_partial || true
 
@@ -927,13 +1011,23 @@ handle_error() {
 }
 
 on_interrupt() {
+    local signal="${1:-INT}"
+    local exit_code=130
+
+    # 128 + signal number is the conventional exit status.
+    # 128 + 信号编号是约定的退出码。
+    if [ "$signal" = "TERM" ]; then
+        exit_code=143
+    fi
+
     log_warn warn_interrupt
     cleanup_partial || true
-    exit 130
+    exit "$exit_code"
 }
 
 trap 'handle_error "$LINENO"' ERR
-trap 'on_interrupt' INT TERM
+trap 'on_interrupt INT' INT
+trap 'on_interrupt TERM' TERM
 
 show_usage() {
     msg usage_body "$SCRIPT_NAME"
@@ -967,6 +1061,7 @@ set_swap_size() {
     fi
 
     SWAP_SIZE_GB="$value"
+    SWAP_SIZE_USER=1
 }
 
 parse_arguments() {
@@ -1016,7 +1111,9 @@ parse_arguments() {
                 ;;
             *)
                 log_error err_unknown_argument "$1"
-                show_usage
+                # The help text belongs to the error stream in this path.
+                # 参数错误时，帮助文本也应走错误输出。
+                show_usage >&2
                 exit 2
                 ;;
         esac
@@ -1051,7 +1148,7 @@ check_operating_system() {
         exit 1
     fi
 
-    log_ok ok_os_detected "${PRETTY_NAME}"
+    log_ok ok_os_detected "${PRETTY_NAME:-unknown}"
 }
 
 check_required_commands() {
@@ -1067,7 +1164,7 @@ check_required_commands() {
         df
         free
         grep
-        head
+        ls
         mkdir
         mktemp
         mv
@@ -1080,10 +1177,11 @@ check_required_commands() {
         tr
     )
 
-    # Only an install creates a swap file, a restore never needs mkswap.
+    # Only a real install creates a swap file: a restore and a dry run never
+    # need mkswap.
     #
-    # 只有安装流程需要创建 Swap 文件，恢复流程不需要 mkswap。
-    if [ "$RESTORE" -eq 0 ]; then
+    # 只有正式安装才创建 Swap 文件：恢复流程与预检都不需要 mkswap。
+    if [ "$RESTORE" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
         required_commands+=(mkswap)
     fi
 
@@ -1111,6 +1209,35 @@ check_required_commands() {
     fi
 
     log_ok ok_commands
+}
+
+# Two installs running at the same time would both append the fstab entry and
+# overwrite each other's install record, so a real run takes an exclusive lock.
+# The lock file lives in /run and disappears on the next boot.
+#
+# 两个安装实例同时运行会各自追加 fstab 条目，并互相覆盖安装记录，
+# 所以正式运行会先取一把排他锁。锁文件放在 /run，下次开机会自然消失。
+acquire_lock() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        return 0
+    fi
+
+    if ! have flock; then
+        log_warn warn_no_flock
+        return 0
+    fi
+
+    if ! exec 9>"$LOCK_FILE"; then
+        log_error err_lock_file "$LOCK_FILE"
+        return 1
+    fi
+
+    if ! flock -n 9; then
+        log_error err_already_running
+        return 1
+    fi
+
+    return 0
 }
 
 get_memory_mb() {
@@ -1178,16 +1305,21 @@ write_swap_sysctl() {
         return 1
     fi
 
-    if ! cat > "$SWAP_CONFIG" <<'EOF'
+    # The heredoc is intentionally unquoted so the expected values come from
+    # the constants above. It contains no $ or backslash of its own.
+    #
+    # 这里刻意不引用 heredoc 的结束标记，让期望值来自上面的常量。
+    # 正文本身不含 $ 或反斜杠，不会发生意外展开。
+    if ! cat > "$SWAP_CONFIG" <<EOF
 # Managed by debian-swap-bbr
 # 由 debian-swap-bbr 管理
 # Lower values reduce the preference for swapping application memory.
 # 较低的值会降低换出应用内存的倾向。
-vm.swappiness=10
+vm.swappiness=${EXPECTED_SWAPPINESS}
 
 # Keep filesystem metadata cache available for longer.
 # 让文件系统元数据缓存保留更久。
-vm.vfs_cache_pressure=50
+vm.vfs_cache_pressure=${EXPECTED_VFS_CACHE_PRESSURE}
 EOF
     then
         log_error err_write_file "$SWAP_CONFIG"
@@ -1232,8 +1364,23 @@ swap_is_active() {
     return 1
 }
 
+# Only the first line decides ownership: a user file that merely mentions the
+# marker somewhere further down must keep being treated as the user's file.
+# The line is read with the read builtin instead of a pipe, so a long first
+# line cannot turn into a SIGPIPE failure under pipefail.
+#
+# 只有首行决定归属：仅在后面某行提到标记的用户文件，必须仍然算用户自己的文件。
+# 这里用 read 内建读取首行而不是管道，避免超长首行在 pipefail 下变成 SIGPIPE 失败。
 file_has_marker() {
-    grep -q -m1 'Managed by debian-swap-bbr' "$1" 2>/dev/null
+    local first_line=""
+
+    # Guard first: a redirection failure would otherwise print a shell error.
+    # 先判断可读性：否则重定向失败会打印一条 shell 错误。
+    [ -r "$1" ] || return 1
+
+    IFS= read -r first_line < "$1" || true
+
+    [ "$first_line" = '# Managed by debian-swap-bbr' ]
 }
 
 get_root_fstype() {
@@ -1255,7 +1402,7 @@ check_swapfile_support() {
     log_info info_root_fstype "$ROOT_FSTYPE"
 
     case "$ROOT_FSTYPE" in
-        overlay|overlayfs|aufs|tmpfs|ramfs|zfs|nfs|nfs4|cifs|smb3|9p|fuse*)
+        overlay|overlayfs|aufs|tmpfs|ramfs|zfs|nfs|nfs4|cifs|smb3|9p|virtiofs|ceph|glusterfs|fuse*)
             log_error err_fstype_unsupported "$ROOT_FSTYPE"
             log_error err_fstype_detail "$SWAPFILE"
             log_error err_fstype_hint
@@ -1465,6 +1612,15 @@ configure_swap() {
         log_info info_swap_active "$(printf '%s' "$active_swap" | tr '\n' ' ')"
         log_info info_swap_preserved "$SWAPFILE"
 
+        # A compressed zram swap wants a much higher swappiness, so the value
+        # written below can actively hurt those hosts.
+        #
+        # 压缩型 zram Swap 需要高得多的 swappiness，
+        # 下面写入的取值可能反而拖慢这类机器。
+        if grep -q '^/dev/zram' <<< "$active_swap"; then
+            log_warn warn_zram_swappiness
+        fi
+
         if swap_is_active "$SWAPFILE"; then
             if ! ensure_fstab_entry; then
                 return 1
@@ -1490,6 +1646,14 @@ configure_swap() {
         if is_swap_signature; then
             log_info info_swapfile_signature "$SWAPFILE"
             existing_valid=1
+
+            # The existing file wins over --swap-size, say so instead of
+            # silently ignoring the option.
+            #
+            # 现有文件优先于 --swap-size，明确提示，而不是静默忽略该参数。
+            if [ "$SWAP_SIZE_USER" -eq 1 ]; then
+                log_warn warn_swap_size_ignored "$SWAPFILE"
+            fi
         else
             log_error err_swapfile_unknown "$SWAPFILE"
             log_error err_swapfile_keep
@@ -1538,6 +1702,11 @@ configure_swap() {
         log_error err_swapon_not_listed "$SWAPFILE"
         swapoff "$SWAPFILE" 2>/dev/null || true
         SWAP_ACTIVATED=0
+        # The rollback must also clear the record, otherwise the install state
+        # claims a swap that was switched off again.
+        #
+        # 回滚时记录也要清掉，否则安装记录会声称一个已被停用的 Swap 仍然启用。
+        MF_SWAPFILE_ENABLED=0
         return 1
     fi
 
@@ -1817,7 +1986,13 @@ verify_restore() {
     local failed=0
     local value
 
-    if swap_is_active "$SWAPFILE"; then
+    # Only a swap this script enabled has to disappear. A /swapfile that was
+    # already active before the install is intentionally left running, so
+    # requiring it to be gone would make --restore fail forever on such hosts.
+    #
+    # 只有本脚本启用过的 Swap 才要求消失。安装前就已启用的 /swapfile
+    # 是故意保留的，如果一律要求它停用，这类机器上的 --restore 会永远失败。
+    if [ "$MF_SWAPFILE_ENABLED" -eq 1 ] && swap_is_active "$SWAPFILE"; then
         log_error err_verify_swap_active "$SWAPFILE"
         failed=1
     fi
@@ -1881,6 +2056,20 @@ restore_all() {
         fi
     fi
 
+    # The fstab entry is removed first: if the restore is interrupted after
+    # this point, the system boots with a clean fstab instead of a mount entry
+    # pointing at a swap file that no longer exists.
+    #
+    # 先移除 fstab 条目：此后即使恢复被中断，开机时看到的也是干净的 fstab，
+    # 而不是一个指向已被删除文件的挂载项。
+    if [ "$MF_FSTAB_ADDED" -eq 1 ]; then
+        if ! remove_fstab_entry; then
+            failed=1
+        fi
+    elif fstab_has_swapfile; then
+        log_info info_fstab_kept "$FSTAB"
+    fi
+
     # The file is deleted only when the install record proves this script
     # created it, an already existing swap file is always kept.
     #
@@ -1897,14 +2086,6 @@ restore_all() {
             log_error err_remove_file "$SWAPFILE"
             failed=1
         fi
-    fi
-
-    if [ "$MF_FSTAB_ADDED" -eq 1 ]; then
-        if ! remove_fstab_entry; then
-            failed=1
-        fi
-    elif fstab_has_swapfile; then
-        log_info info_fstab_kept "$FSTAB"
     fi
 
     if [ -n "$MF_BACKUP_DIR" ] && [ ! -d "$MF_BACKUP_DIR" ]; then
@@ -2056,11 +2237,11 @@ configure_bbr() {
         return 1
     fi
 
-    if ! cat > "$BBR_CONFIG" <<'EOF'
+    if ! cat > "$BBR_CONFIG" <<EOF
 # Managed by debian-swap-bbr
 # 由 debian-swap-bbr 管理
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
+net.core.default_qdisc=${EXPECTED_QDISC}
+net.ipv4.tcp_congestion_control=${EXPECTED_CC}
 EOF
     then
         log_error err_write_file "$BBR_CONFIG"
@@ -2085,11 +2266,13 @@ EOF
 
 check_sysctl_conflicts() {
     local file
+    local real
     local line
     local key
     local value
     local expected
-    local found=0
+    local overridden=0
+    local -A scanned=()
 
     # Both /etc/sysctl.conf and the snippets in /etc/sysctl.d are scanned,
     # the two files written by this script are skipped. A snippet that sets
@@ -2106,28 +2289,54 @@ check_sysctl_conflicts() {
             continue
         fi
 
+        # /etc/sysctl.d/99-sysctl.conf is a symlink to /etc/sysctl.conf on
+        # Debian, so both paths would report the same conflict twice.
+        #
+        # Debian 上 /etc/sysctl.d/99-sysctl.conf 是指向 /etc/sysctl.conf 的
+        # 软链，两个路径都扫描会把同一个冲突报告两次。
+        real="$file"
+        if have readlink; then
+            real=$(readlink -f -- "$file" 2>/dev/null) || real="$file"
+        fi
+
+        if [ -n "${scanned[$real]:-}" ]; then
+            continue
+        fi
+
+        scanned[$real]=1
+
         while IFS= read -r line; do
+            # Drop an inline comment first: "key=value # note" is still
+            # "key=value", and a leading "-" only tells sysctl to ignore
+            # write errors.
+            #
+            # 先去掉行尾注释："key=value # 说明" 仍然等价于 "key=value"；
+            # 行首的 "-" 只是让 sysctl 忽略写入错误。
+            line="${line%%#*}"
             key="${line%%=*}"
             key="${key//[[:space:]]/}"
+            key="${key#-}"
 
             case "$key" in
-                ''|'#'*)
-                    continue
-                    ;;
-                vm.swappiness)
-                    expected="10"
-                    ;;
-                vm.vfs_cache_pressure)
-                    expected="50"
-                    ;;
-                net.ipv4.tcp_congestion_control)
-                    expected="bbr"
-                    ;;
-                net.core.default_qdisc)
-                    expected="fq"
+                vm.swappiness|vm.vfs_cache_pressure|net.ipv4.tcp_congestion_control|net.core.default_qdisc)
                     ;;
                 *)
                     continue
+                    ;;
+            esac
+
+            case "$key" in
+                vm.swappiness)
+                    expected="$EXPECTED_SWAPPINESS"
+                    ;;
+                vm.vfs_cache_pressure)
+                    expected="$EXPECTED_VFS_CACHE_PRESSURE"
+                    ;;
+                net.ipv4.tcp_congestion_control)
+                    expected="$EXPECTED_CC"
+                    ;;
+                net.core.default_qdisc)
+                    expected="$EXPECTED_QDISC"
                     ;;
             esac
 
@@ -2139,11 +2348,21 @@ check_sysctl_conflicts() {
             fi
 
             log_warn warn_sysctl_conflict "$file" "$key"
-            found=1
+
+            # /etc/sysctl.conf is applied last by "sysctl --system", and a
+            # snippet sorting after this script wins at boot. A snippet that
+            # sorts before the script cannot override it, so stay quiet then.
+            #
+            # "sysctl --system" 最后应用 /etc/sysctl.conf；排序在本脚本之后
+            # 的片段在开机时也会覆盖本脚本。排序在前的片段覆盖不了，不提示。
+            if [ "$file" = "/etc/sysctl.conf" ] ||
+               [[ "${file##*/}" > "${BBR_CONFIG##*/}" ]]; then
+                overridden=1
+            fi
         done < "$file"
     done
 
-    if [ "$found" -eq 1 ]; then
+    if [ "$overridden" -eq 1 ]; then
         log_warn warn_sysctl_order
     fi
 
@@ -2161,15 +2380,15 @@ verify_result() {
         fi
 
         value=$(sysctl -n vm.swappiness 2>/dev/null) || value=""
-        if [ "$value" != "10" ]; then
-            log_error err_verify_value "vm.swappiness" "10" "${value:-unknown}"
+        if [ "$value" != "$EXPECTED_SWAPPINESS" ]; then
+            log_error err_verify_value "vm.swappiness" "$EXPECTED_SWAPPINESS" "${value:-unknown}"
             log_error err_verify_hint "$SWAP_CONFIG"
             failed=1
         fi
 
         value=$(sysctl -n vm.vfs_cache_pressure 2>/dev/null) || value=""
-        if [ "$value" != "50" ]; then
-            log_error err_verify_value "vm.vfs_cache_pressure" "50" "${value:-unknown}"
+        if [ "$value" != "$EXPECTED_VFS_CACHE_PRESSURE" ]; then
+            log_error err_verify_value "vm.vfs_cache_pressure" "$EXPECTED_VFS_CACHE_PRESSURE" "${value:-unknown}"
             log_error err_verify_hint "$SWAP_CONFIG"
             failed=1
         fi
@@ -2177,15 +2396,15 @@ verify_result() {
 
     if [ "$BBR_CONFIGURED" -eq 1 ]; then
         value=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || value=""
-        if [ "$value" != "bbr" ]; then
-            log_error err_verify_value "net.ipv4.tcp_congestion_control" "bbr" "${value:-unknown}"
+        if [ "$value" != "$EXPECTED_CC" ]; then
+            log_error err_verify_value "net.ipv4.tcp_congestion_control" "$EXPECTED_CC" "${value:-unknown}"
             log_error err_verify_hint "$BBR_CONFIG"
             failed=1
         fi
 
         value=$(sysctl -n net.core.default_qdisc 2>/dev/null) || value=""
-        if [ "$value" != "fq" ]; then
-            log_warn warn_verify_qdisc "net.core.default_qdisc" "fq" "${value:-unknown}"
+        if [ "$value" != "$EXPECTED_QDISC" ]; then
+            log_warn warn_verify_qdisc "net.core.default_qdisc" "$EXPECTED_QDISC" "${value:-unknown}"
             log_warn warn_verify_qdisc_hint
         fi
     fi
@@ -2285,13 +2504,20 @@ main() {
 
     # Resolve the language before parsing so that parse errors are localized.
     # 先确定语言再解析参数，这样参数错误也能用正确的语言提示。
-    LANGUAGE=$(detect_language)
+    OUTPUT_LANG=$(detect_language)
     prescan_language "$@"
 
     parse_arguments "$@"
     require_root
     check_operating_system
     check_required_commands
+
+    # Serialize before the install record is read or written.
+    # 读取或写入安装记录之前先串行化。
+    if ! acquire_lock; then
+        exit 1
+    fi
+
     load_state
 
     if [ "$RESTORE" -eq 1 ]; then

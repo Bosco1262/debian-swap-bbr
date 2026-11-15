@@ -5,3 +5,8 @@
 *.md      text eol=lf
 *.yml     text eol=lf
 LICENSE   text eol=lf
+
+# 这些文件按行解析，CRLF 会让指令值带上 \r，导致静默失效。
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+.shellcheckrc  text eol=lf

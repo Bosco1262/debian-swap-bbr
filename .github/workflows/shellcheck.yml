@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   pull_request:
     branches:
       - main
@@ -12,10 +14,17 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same ref makes the previous run pointless.
+# 同一 ref 的新提交会让上一次运行失去意义。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  shellcheck:
-    name: Check Bash script
+  static:
+    name: Static checks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Check out repository
@@ -23,10 +32,30 @@ jobs:
 
       - name: Check Bash syntax
         shell: bash
-        run: bash -n setup-swap-bbr.sh
+        run: |
+          bash -n setup-swap-bbr.sh
+          bash -n tests/cli.sh
+          bash -n tests/check-messages.sh
 
       - name: Run ShellCheck
         uses: ludeeus/action-shellcheck@2.0.0
         with:
           scandir: .
           severity: warning
+
+      - name: Check message tables
+        shell: bash
+        run: bash tests/check-messages.sh
+
+  cli:
+    name: CLI behaviour
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Run CLI checks
+        shell: bash
+        run: bash tests/cli.sh

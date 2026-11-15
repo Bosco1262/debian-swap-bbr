@@ -28,6 +28,7 @@ The script inspects the current state and applies the configuration idempotently
 - Support `--dry-run` for a read-only check
 - Support `--restore` to undo only the changes this script made
 - Support `--lang` for the output language
+- Serialize concurrent runs with a lock, so two runs cannot interleave
 - Stay idempotent
 
 ## What the script does not do
@@ -65,6 +66,7 @@ Any architecture works, as long as the running Debian kernel provides `tcp_bbr`.
 | ZFS                     | Not supported, the script exits with an error                          |
 | overlayfs / aufs        | Not supported (common in Docker), the script exits with an error       |
 | NFS / CIFS / 9p / FUSE  | Not supported, the script exits with an error                          |
+| virtiofs / Ceph / GlusterFS | Not supported, the script exits with an error                      |
 
 On btrfs the `chattr` command must be installed, otherwise the script refuses to create the swap file.
 
@@ -132,7 +134,7 @@ curl URL | bash
 
 ```text
 --swap-size N    Swap size in GiB, 1 to 32, --swap-size=N also works
--l, --lang LANG  Output language: en or zh-CN
+-l, --lang LANG  Output language: en or zh-CN, --language is an alias
                  Defaults to the system locale, English as the fallback
 -n, --dry-run    Check the environment and print the plan, change nothing
 --restore, --uninstall
@@ -161,7 +163,7 @@ sudo ./setup-swap-bbr.sh --swap-size=4
 The output language follows a fixed priority:
 
 1. An explicit `-l`, `--lang` or `--language` value, either `en` or `zh-CN`.
-2. The system locale (`LC_ALL`, `LC_MESSAGES`, `LANG`).
+2. `LANGUAGE`, then the system locale (`LC_ALL`, `LC_MESSAGES`, `LANG`).
 3. English as the guaranteed fallback.
 
 ```bash
@@ -257,23 +259,28 @@ The script manages these files:
 /etc/sysctl.d/99-zz-local-bbr.conf
 /etc/modules-load.d/bbr.conf
 /var/lib/debian-swap-bbr/state
+/run/debian-swap-bbr.lock
 ```
 
-`/var/lib/debian-swap-bbr/state` is the install record, `--restore` uses it to decide whether a change was made by this script. `/var/lib/debian-swap-bbr/backup.*` only appears when something had to be backed up: a migrated legacy config, or a user file that already existed at a managed path.
+`/var/lib/debian-swap-bbr/state` is the install record, `--restore` uses it to decide whether a change was made by this script. It is written to a temporary file and renamed, so an interrupted run cannot leave a truncated record. `/var/lib/debian-swap-bbr/backup.*` only appears when something had to be backed up: a migrated legacy config, or a user file that already existed at a managed path.
 
-The file names deliberately sort after `99-sysctl.conf`, which on Debian is a symlink to `/etc/sysctl.conf`, so the values are not overridden at boot. The script also reports conflicting keys found in `/etc/sysctl.conf`.
+`/run/debian-swap-bbr.lock` only exists while a run is in progress. A second run started at the same time exits with status 1 instead of racing the first one. `--dry-run` takes no lock and creates nothing.
+
+The file names deliberately sort after `99-sysctl.conf`, which on Debian is a symlink to `/etc/sysctl.conf`, so the values are not overridden at boot. The script also scans `/etc/sysctl.conf` and `/etc/sysctl.d` for the same keys set to a different value and reports them, skipping the two files it wrote itself and the `99-sysctl.conf` symlink.
 
 When `tcp_bbr` is built into the kernel, the script skips `/etc/modules-load.d/bbr.conf` to avoid a "module not found" message at boot.
 
-When `/etc/fstab` has to be modified, a timestamped backup is created first:
+When `/etc/fstab` has to be modified, a timestamped backup is created first. The process ID keeps two runs in the same second apart:
 
 ```text
-/etc/fstab.bak.YYYYMMDD-HHMMSS
+/etc/fstab.bak.YYYYMMDD-HHMMSS-PID
 ```
+
+These backups are never removed automatically. Delete the old ones yourself once the system behaves as expected.
 
 ### Upgrading from an older version
 
-Older versions used `90-local-*.conf`. The script only deletes those files when their first line contains the `Managed by debian-swap-bbr` marker; anything else is kept and reported.
+Older versions used `90-local-*.conf`. The script only touches those files when their first line is exactly `# Managed by debian-swap-bbr`; anything else is kept and reported. The same first-line rule decides the ownership of every managed config file, so a user file that merely mentions the marker further down stays untouched.
 
 ## Idempotency and failure handling
 
@@ -283,6 +290,9 @@ Older versions used `90-local-*.conf`. The script only deletes those files when 
 - fstab entry already present, whether it uses `none` or `swap` as the mount point: no duplicate is appended
 - Failure during creation: the `/swapfile` created by this run but never enabled is removed
 - Failure of a critical command: the script returns a non-zero status instead of printing "configuration completed"
+- Unexpected failure after a change: the install record is written before exiting, so `--restore` can still undo it
+- Two runs at the same time: the second one exits with status 1 instead of interleaving with the first
+- An existing idle `/swapfile` is reused as it is, and `--swap-size` is reported as ignored instead of being dropped silently
 
 ## Restoring the original state
 
@@ -296,12 +306,13 @@ sudo ./setup-swap-bbr.sh --restore             # apply
 The restore runs in dependency order:
 
 1. `swapoff /swapfile`, only when the record says this script enabled it
-2. Remove `/swapfile`, only when the record says this script created it; an existing file is always kept
-3. Remove the exact line this script wrote from `/etc/fstab` (backed up first)
-4. `systemctl daemon-reload`
-5. Remove `99-zz-local-*.conf` and `modules-load.d/bbr.conf` when they carry the script marker
-6. Move the legacy `90-local-*.conf` files back from the backup directory
-7. Restore the four kernel parameters from the values stored in the record
+2. Remove the exact line this script wrote from `/etc/fstab` (backed up first), then `systemctl daemon-reload`
+3. Remove `/swapfile`, only when the record says this script created it; an existing file is always kept
+4. Remove `99-zz-local-*.conf` and `modules-load.d/bbr.conf` when they carry the script marker
+5. Move the legacy `90-local-*.conf` files back from the backup directory
+6. Restore the four kernel parameters from the values stored in the record
+
+Step 2 comes before step 3 on purpose: if the restore is interrupted in between, the next boot sees a clean `/etc/fstab` instead of a mount entry pointing at a swap file that no longer exists.
 
 The restore never:
 
@@ -315,7 +326,7 @@ Behaviour details:
 
 - `--restore --dry-run` prints the plan and changes nothing
 - A failing `swapoff` (out of memory) aborts the restore and keeps both `/swapfile` and the install record, so it can be retried later
-- Before finishing, the restore re-checks the real state: swap is gone, fstab is clean and the four kernel parameters are back. Any mismatch keeps the install record and returns a non-zero status
+- Before finishing, the restore re-checks the real state: a swap this script enabled is gone, fstab is clean and the four kernel parameters are back. A `/swapfile` that was already active before the install is intentionally left running and does not count as a failure. Any real mismatch keeps the install record and returns a non-zero status
 - A file the user already had at a managed path is moved into `/var/lib/debian-swap-bbr/backup.*` during installation and moved back by the restore; if a newer file appeared at that path, the backup is kept and reported
 - The restore is idempotent, a second run returns 0
 - `--restore` and `--swap-size` are mutually exclusive, using both returns exit code 2
@@ -331,6 +342,7 @@ Behaviour details:
 | `This kernel does not provide BBR`                                    | The kernel lacks BBR or the container does not expose it, the script installs no kernel    |
 | `Verification failed: net.ipv4.tcp_congestion_control`                | A conflicting key in `/etc/sysctl.conf`, or a restricted container                         |
 | `/swapfile exists but cannot be confirmed as a swap file`             | The script refuses to overwrite it, review the file yourself                               |
+| `Another instance is already running`                                 | A concurrent run holds `/run/debian-swap-bbr.lock`, wait for it to finish                |
 | `env: 'bash\r': No such file or directory`                            | The script carries Windows CRLF line endings, run `sed -i 's/\r$//' setup-swap-bbr.sh`     |
 
 The failing line and exit code are taken from the `Script failed at line N with exit code M` message.
@@ -430,6 +442,17 @@ The `.shellcheckrc` in the repository root disables `SC2310` and `SC2311`: every
 ```bash
 bash -n setup-swap-bbr.sh
 ```
+
+### Local test suite
+
+Two scripts cover everything that can be checked without a Debian host:
+
+```bash
+bash tests/check-messages.sh   # MSG_EN and MSG_ZH must expose the same keys
+bash tests/cli.sh              # argument parsing, language prescan, exit codes
+```
+
+Both stop before the root check, so they need no `sudo` and no Debian system, and the CI workflow runs them on every push. The cases that really create a swap file still need a test VM or a snapshot.
 
 ### Code comment convention
 
