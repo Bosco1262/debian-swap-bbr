@@ -42,7 +42,7 @@ set -Eeuo pipefail
 umask 022
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.4.0"
+readonly SCRIPT_VERSION="1.4.1"
 readonly SWAPFILE="/swapfile"
 readonly FSTAB="/etc/fstab"
 readonly SYSCTL_DIR="/etc/sysctl.d"
@@ -1021,6 +1021,16 @@ on_interrupt() {
     fi
 
     log_warn warn_interrupt
+
+    # An interrupt can strike after the system was already changed.
+    # Record what was done first, so a later --restore can still undo it.
+    #
+    # 中断可能发生在系统已经被修改之后。先记账，
+    # 这样之后的 --restore 仍然可以撤销。
+    if [ "$DRY_RUN" -eq 0 ] && [ "$RESTORE" -eq 0 ] && state_changed; then
+        write_state || true
+    fi
+
     cleanup_partial || true
     exit "$exit_code"
 }
@@ -1289,6 +1299,8 @@ ensure_config_dir() {
         log_error err_mkdir_failed "$dir"
         return 1
     fi
+
+    return 0
 }
 
 write_swap_sysctl() {
@@ -1524,17 +1536,20 @@ create_swapfile() {
             status=progress
         then
             log_error err_dd_failed
+            rm -f "$SWAPFILE"
             return 1
         fi
     fi
 
     if ! chmod 600 "$SWAPFILE"; then
         log_error err_chmod_file "$SWAPFILE"
+        rm -f "$SWAPFILE"
         return 1
     fi
 
     if ! mkswap "$SWAPFILE"; then
         log_error err_mkswap "$SWAPFILE"
+        rm -f "$SWAPFILE"
         return 1
     fi
 
@@ -1549,7 +1564,8 @@ create_swapfile() {
 # 该正则同时接受 "none swap" 与 "swap swap" 两种挂载点写法，
 # 兼容 Tab 分隔，并忽略被注释掉的行。
 fstab_has_swapfile() {
-    grep -qE "^[[:space:]]*${SWAPFILE}[[:space:]]+[^#]*[[:space:]]swap([[:space:]]|\$)" "$FSTAB"
+    [ -r "$FSTAB" ] || return 1
+    grep -qE "^[[:space:]]*${SWAPFILE}[[:space:]]+[^#]*[[:space:]]swap([[:space:]]|\$)" "$FSTAB" 2>/dev/null
 }
 
 ensure_fstab_entry() {
@@ -1678,18 +1694,21 @@ configure_swap() {
 
     if [ "$existing_valid" -eq 0 ]; then
         if ! create_swapfile; then
+            cleanup_partial || true
             return 1
         fi
     fi
 
     if ! chmod 600 "$SWAPFILE"; then
         log_error err_chmod_file "$SWAPFILE"
+        cleanup_partial || true
         return 1
     fi
 
     if ! swapon "$SWAPFILE"; then
         log_error err_swapon "$SWAPFILE"
         log_error err_swapon_reason
+        cleanup_partial || true
         return 1
     fi
 
@@ -1823,10 +1842,22 @@ remove_fstab_entry() {
         return 1
     fi
 
-    if ! cat "$tmp_file" > "$FSTAB"; then
-        rm -f "$tmp_file"
-        log_error err_write_file "$FSTAB"
-        return 1
+    # Set permissions to match the original fstab before replacing it.
+    # 替换前先将临时文件权限与原 fstab 保持一致。
+    chmod --reference="$FSTAB" "$tmp_file" 2>/dev/null || chmod 644 "$tmp_file"
+    chown --reference="$FSTAB" "$tmp_file" 2>/dev/null || true
+
+    # Atomic rename prevents leaving a truncated fstab on unexpected interruption.
+    # If fstab is a symlink or rename fails (e.g. fstab is bind-mounted), fall back to rewriting.
+    #
+    # 原子重命名可避免意外中断时留下被截断的 fstab。
+    # 若 fstab 为软链接或重命名失败（例如 fstab 是 bind-mount 挂载），则回退到回写。
+    if [ -L "$FSTAB" ] || ! mv -f "$tmp_file" "$FSTAB" 2>/dev/null; then
+        if ! cat "$tmp_file" > "$FSTAB"; then
+            rm -f "$tmp_file"
+            log_error err_write_file "$FSTAB"
+            return 1
+        fi
     fi
 
     rm -f "$tmp_file"
@@ -2167,22 +2198,32 @@ configure_bbr() {
         log_info info_virt "$virtualization"
     fi
 
+    available_cc=$(
+        sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null ||
+            true
+    )
+
     if have modprobe; then
         if modprobe -n tcp_bbr >/dev/null 2>&1; then
             module_available=1
         fi
 
-        if [ "$DRY_RUN" -eq 0 ] && ! modprobe tcp_bbr 2>/dev/null; then
-            log_warn warn_modprobe_failed
+        # Only attempt modprobe if BBR is not already available in the running kernel.
+        # 仅当当前运行的内核中尚未启用 BBR 时，才尝试通过 modprobe 加载模块。
+        if ! grep -qw 'bbr' <<< "$available_cc"; then
+            if [ "$DRY_RUN" -eq 0 ]; then
+                if ! modprobe tcp_bbr 2>/dev/null; then
+                    log_warn warn_modprobe_failed
+                fi
+                available_cc=$(
+                    sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null ||
+                        true
+                )
+            fi
         fi
-    else
+    elif ! grep -qw 'bbr' <<< "$available_cc"; then
         log_warn warn_modprobe_missing
     fi
-
-    available_cc=$(
-        sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null ||
-            true
-    )
 
     if ! grep -qw 'bbr' <<< "$available_cc"; then
         if [ "$DRY_RUN" -eq 1 ] && [ "$module_available" -eq 1 ]; then
@@ -2305,14 +2346,15 @@ check_sysctl_conflicts() {
 
         scanned[$real]=1
 
-        while IFS= read -r line; do
-            # Drop an inline comment first: "key=value # note" is still
-            # "key=value", and a leading "-" only tells sysctl to ignore
-            # write errors.
+        while IFS= read -r line || [ -n "$line" ]; do
+            # Drop an inline comment first: both "#" and ";" are comment
+            # delimiters in sysctl configuration files (sysctl.d).
+            # A leading "-" only tells sysctl to ignore write errors.
             #
-            # 先去掉行尾注释："key=value # 说明" 仍然等价于 "key=value"；
+            # 先去掉行尾注释：sysctl 配置文件同时支持 "#" 与 ";" 作为注释符；
             # 行首的 "-" 只是让 sysctl 忽略写入错误。
             line="${line%%#*}"
+            line="${line%%;*}"
             key="${line%%=*}"
             key="${key//[[:space:]]/}"
             key="${key#-}"
@@ -2325,18 +2367,23 @@ check_sysctl_conflicts() {
                     ;;
             esac
 
+            local script_conf
             case "$key" in
                 vm.swappiness)
                     expected="$EXPECTED_SWAPPINESS"
+                    script_conf="${SWAP_CONFIG##*/}"
                     ;;
                 vm.vfs_cache_pressure)
                     expected="$EXPECTED_VFS_CACHE_PRESSURE"
+                    script_conf="${SWAP_CONFIG##*/}"
                     ;;
                 net.ipv4.tcp_congestion_control)
                     expected="$EXPECTED_CC"
+                    script_conf="${BBR_CONFIG##*/}"
                     ;;
                 net.core.default_qdisc)
                     expected="$EXPECTED_QDISC"
+                    script_conf="${BBR_CONFIG##*/}"
                     ;;
             esac
 
@@ -2350,13 +2397,13 @@ check_sysctl_conflicts() {
             log_warn warn_sysctl_conflict "$file" "$key"
 
             # /etc/sysctl.conf is applied last by "sysctl --system", and a
-            # snippet sorting after this script wins at boot. A snippet that
-            # sorts before the script cannot override it, so stay quiet then.
+            # snippet sorting after this script's corresponding file wins at boot.
+            # A snippet that sorts before the script cannot override it, so stay quiet then.
             #
-            # "sysctl --system" 最后应用 /etc/sysctl.conf；排序在本脚本之后
-            # 的片段在开机时也会覆盖本脚本。排序在前的片段覆盖不了，不提示。
+            # "sysctl --system" 最后应用 /etc/sysctl.conf；排序在本脚本对应
+            # 配置文件之后的片段在开机时也会覆盖本脚本。排序在前的片段覆盖不了，不提示。
             if [ "$file" = "/etc/sysctl.conf" ] ||
-               [[ "${file##*/}" > "${BBR_CONFIG##*/}" ]]; then
+               [[ "${file##*/}" > "$script_conf" ]]; then
                 overridden=1
             fi
         done < "$file"
@@ -2460,7 +2507,9 @@ show_result() {
     printf '%s\n' "$(msg result_root_fstype "$fstype")"
     printf '%s\n' "$(msg result_swap_conf "$SWAP_CONFIG")"
     printf '%s\n' "$(msg result_bbr_conf "$BBR_CONFIG")"
-    printf '%s\n' "$(msg result_bbr_module_conf "$BBR_MODULE_CONFIG")"
+    if [ "$DRY_RUN" -eq 1 ] || [ "$MF_MODULE_CONFIG" -eq 1 ] || [ -f "$BBR_MODULE_CONFIG" ]; then
+        printf '%s\n' "$(msg result_bbr_module_conf "$BBR_MODULE_CONFIG")"
+    fi
 
     if [ "$DRY_RUN" -eq 0 ] || [ -e "$STATE_FILE" ]; then
         printf '%s\n' "$(msg result_state_file "$STATE_FILE")"
@@ -2541,6 +2590,7 @@ main() {
     if ! configure_swap; then
         failed=1
         log_error err_swap_incomplete
+        cleanup_partial || true
     fi
 
     if ! configure_bbr; then

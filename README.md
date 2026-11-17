@@ -1,6 +1,6 @@
 # Debian Swap and BBR Setup
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | [简体中文](README.zh-CN.md) | [Code Walkthrough](docs/walkthrough.md)
 
 A script that configures swap and the standard BBR congestion control on a fresh Debian server.
 
@@ -290,7 +290,7 @@ Older versions used `90-local-*.conf`. The script only touches those files when 
 - fstab entry already present, whether it uses `none` or `swap` as the mount point: no duplicate is appended
 - Failure during creation: the `/swapfile` created by this run but never enabled is removed
 - Failure of a critical command: the script returns a non-zero status instead of printing "configuration completed"
-- Unexpected failure after a change: the install record is written before exiting, so `--restore` can still undo it
+- Unexpected failure or interruption (Ctrl+C) after a change: the install record is written before exiting, so `--restore` can still undo it
 - Two runs at the same time: the second one exits with status 1 instead of interleaving with the first
 - An existing idle `/swapfile` is reused as it is, and `--swap-size` is reported as ignored instead of being dropped silently
 
@@ -306,7 +306,7 @@ sudo ./setup-swap-bbr.sh --restore             # apply
 The restore runs in dependency order:
 
 1. `swapoff /swapfile`, only when the record says this script enabled it
-2. Remove the exact line this script wrote from `/etc/fstab` (backed up first), then `systemctl daemon-reload`
+2. Remove the exact line this script wrote from `/etc/fstab` (atomic replacement with symlink preservation, backed up first), then `systemctl daemon-reload`
 3. Remove `/swapfile`, only when the record says this script created it; an existing file is always kept
 4. Remove `99-zz-local-*.conf` and `modules-load.d/bbr.conf` when they carry the script marker
 5. Move the legacy `90-local-*.conf` files back from the backup directory
@@ -508,6 +508,12 @@ sudo ./setup-swap-bbr.sh --restore --dry-run        # print the plan only
 sudo ./setup-swap-bbr.sh --restore                  # undo what the script created
 sudo ./setup-swap-bbr.sh --restore --swap-size 2    # must exit with 2
 ```
+
+## Code Walkthrough & Architecture
+
+If you want an in-depth breakdown of the internal implementation, function-by-function explanations, or mapping between Bash and Python concepts, refer to:
+- [Code Walkthrough](docs/walkthrough.md) (English)
+- [代码深度讲解与架构解析](docs/walkthrough.zh-CN.md) (简体中文)
 
 ## Security notes
 

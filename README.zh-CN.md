@@ -1,6 +1,6 @@
 # Debian Swap and BBR Setup
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | [简体中文](README.zh-CN.md) | [代码讲解](docs/walkthrough.zh-CN.md)
 
 一个用于 Debian 新服务器的 Swap 和标准 BBR 自动配置脚本。
 
@@ -291,7 +291,7 @@ lsmod | grep tcp_bbr
 - fstab 已有 `/swapfile` 条目（无论挂载点写 `none` 还是 `swap`）：不会重复追加
 - 创建过程中失败：脚本会删除本次创建但未能启用的 `/swapfile`，避免留下无效文件
 - 关键命令失败：立即返回非 0 退出码，而不是继续打印"配置完成"
-- 已修改系统后发生未预期错误：退出前先写入安装记录，`--restore` 仍然可以撤销
+- 已修改系统后发生未预期错误或用户中断（Ctrl+C）：退出前先写入安装记录，`--restore` 仍然可以撤销
 - 同一时刻运行两个实例：第二个实例以退出码 1 结束，不会与前一个交错
 - 已有但未启用的 `/swapfile`：原样复用，并明确提示 `--swap-size` 被忽略，而不是静默丢弃
 
@@ -307,7 +307,7 @@ sudo ./setup-swap-bbr.sh --restore             # 正式恢复
 恢复按依赖顺序执行：
 
 1. `swapoff /swapfile`（只有清单记录"由脚本启用"时才执行）
-2. 从 `/etc/fstab` 删除由脚本写入的那一行（精确匹配，删除前备份），随后 `systemctl daemon-reload`
+2. 从 `/etc/fstab` 删除由脚本写入的那一行（精确匹配、原子替换并兼容软链接，删除前备份），随后 `systemctl daemon-reload`
 3. 删除 `/swapfile`（只有清单记录"由脚本创建"时才执行，已有文件一律保留）
 4. 删除带脚本标记的 `99-zz-local-*.conf` 与 `modules-load.d/bbr.conf`
 5. 把旧版本 `90-local-*.conf` 从备份目录放回原位
@@ -509,6 +509,12 @@ sudo ./setup-swap-bbr.sh --restore --dry-run        # 只打印计划
 sudo ./setup-swap-bbr.sh --restore                  # 撤销脚本创建的配置
 sudo ./setup-swap-bbr.sh --restore --swap-size 2    # 应退出码 2
 ```
+
+## 代码深度解析
+
+如果你希望详细了解脚本的内部实现细节、每一行函数的作用或 Bash 与 Python 的概念映射，请参阅：
+- [代码深度讲解与架构解析](docs/walkthrough.zh-CN.md)（简体中文）
+- [Code Walkthrough](docs/walkthrough.md)（English）
 
 ## 安全说明
 
